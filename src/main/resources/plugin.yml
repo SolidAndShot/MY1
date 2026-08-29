@@ -8,8 +8,8 @@ description: A Folia-compatible crowbar that calls lightning when it hits a livi
 
 commands:
   lightningcrowbar:
-    description: Gives a lightning crowbar.
-    usage: /lightningcrowbar give [player]
+    description: Gives plugin items.
+    usage: /lightningcrowbar give [player] or /lightningcrowbar givebrick [player]
     aliases: [lcrowbar]
     permission: lightningcrowbar.give
 
