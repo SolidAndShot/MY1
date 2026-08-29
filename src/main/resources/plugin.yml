@@ -1,0 +1,19 @@
+name: LightningCrowbar
+version: '${version}'
+main: com.solidandshot.lightningcrowbar.LightningCrowbarPlugin
+api-version: '26.2'
+folia-supported: true
+author: SolidAndShot
+description: A Folia-compatible crowbar that calls lightning when it hits a living entity.
+
+commands:
+  lightningcrowbar:
+    description: Gives a lightning crowbar.
+    usage: /lightningcrowbar give [player]
+    aliases: [lcrowbar]
+    permission: lightningcrowbar.give
+
+permissions:
+  lightningcrowbar.give:
+    description: Allows the player to obtain a lightning crowbar.
+    default: op
