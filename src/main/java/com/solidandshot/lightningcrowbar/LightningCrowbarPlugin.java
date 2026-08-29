@@ -22,6 +22,7 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.event.player.PlayerVelocityEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.ShapedRecipe;
@@ -218,6 +219,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     public void onPlayerInput(PlayerInputEvent event) {
         Player player = event.getPlayer();
         UUID playerId = player.getUniqueId();
+        InputState previous = inputStates.getOrDefault(playerId, InputState.EMPTY);
         InputState current = InputState.from(event.getInput());
         inputStates.put(playerId, current);
 
@@ -230,6 +232,21 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
             if (current.movementActive()) {
                 releaseAnchor(player, state, true);
             }
+        } else if (state.mode == AnchorMode.ADJUSTING && current.jump && !previous.jump) {
+            adjustFromInput(state, current.verticalOnly(true), player);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.NORMAL, ignoreCancelled = true)
+    public void onPlayerToggleSneak(PlayerToggleSneakEvent event) {
+        if (!event.isSneaking()) {
+            return;
+        }
+
+        AnchorState state = anchors.get(event.getPlayer().getUniqueId());
+        if (state != null && state.mode == AnchorMode.ADJUSTING) {
+            InputState current = InputState.from(event.getPlayer().getCurrentInput());
+            adjustFromInput(state, current.verticalOnly(false), event.getPlayer());
         }
     }
 
@@ -318,7 +335,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
             InputState current = InputState.from(player.getCurrentInput());
             inputStates.put(playerId, current);
-            adjustFromInput(activeState, current, player);
+            adjustFromInput(activeState, current.horizontalOnly(), player);
         }, () -> adjustmentTasks.remove(playerId), 1L, 1L);
         adjustmentTasks.put(playerId, task);
     }
@@ -336,8 +353,8 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         double yawRadians = Math.toRadians(yaw);
         double forwardX = -Math.sin(yawRadians);
         double forwardZ = Math.cos(yawRadians);
-        double rightX = Math.cos(yawRadians);
-        double rightZ = Math.sin(yawRadians);
+        double rightX = -Math.cos(yawRadians);
+        double rightZ = -Math.sin(yawRadians);
         double moveX = 0;
         double moveY = 0;
         double moveZ = 0;
@@ -369,7 +386,35 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         }
 
         state.location = offset(state.location, moveX, moveY, moveZ, player.getLocation());
-        player.teleport(state.location.clone());
+        requestAnchorTeleport(player, state);
+    }
+
+    private void requestAnchorTeleport(Player player, AnchorState state) {
+        if (state.teleportPending) {
+            return;
+        }
+
+        UUID playerId = player.getUniqueId();
+        state.teleportPending = true;
+        Location target = state.location.clone();
+        player.teleportAsync(target).whenComplete((success, failure) -> player.getScheduler().run(this, task -> {
+            AnchorState activeState = anchors.get(playerId);
+            if (activeState != state || activeState.mode != AnchorMode.ADJUSTING || !player.isOnline()) {
+                if (activeState == state) {
+                    state.teleportPending = false;
+                }
+                return;
+            }
+
+            state.teleportPending = false;
+            if (!samePosition(player.getLocation(), state.location)) {
+                requestAnchorTeleport(player, state);
+            }
+        }, () -> {
+            if (anchors.get(playerId) == state) {
+                state.teleportPending = false;
+            }
+        }));
     }
 
     private void releaseAnchor(Player player, AnchorState state, boolean notify) {
@@ -482,6 +527,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         private Location location;
         private AnchorMode mode = AnchorMode.FIXED;
         private final boolean originalGravity;
+        private boolean teleportPending;
 
         private AnchorState(Location location, boolean originalGravity) {
             this.location = location.clone();
@@ -524,6 +570,14 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
         private boolean movementActive() {
             return forward || backward || left || right || jump || sneak;
+        }
+
+        private InputState horizontalOnly() {
+            return new InputState(forward, backward, left, right, false, false, sprint);
+        }
+
+        private InputState verticalOnly(boolean up) {
+            return new InputState(false, false, false, false, up, !up, sprint);
         }
     }
 }
