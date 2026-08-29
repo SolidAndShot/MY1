@@ -30,6 +30,7 @@ import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.Input;
 import org.bukkit.util.Vector;
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 
@@ -46,12 +47,13 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     private static final Component NAIL_BRICK_NAME = Component.text("钉砖", NamedTextColor.AQUA);
     private static final double FINE_STEP = 0.05;
     private static final double LARGE_STEP = 0.5;
-    private static final double POSITION_EPSILON = 0.0001;
+    private static final double POSITION_EPSILON = 0.00000001;
 
     private NamespacedKey crowbarKey;
     private NamespacedKey nailBrickKey;
     private final Map<UUID, AnchorState> anchors = new ConcurrentHashMap<>();
     private final Map<UUID, InputState> inputStates = new ConcurrentHashMap<>();
+    private final Map<UUID, ScheduledTask> adjustmentTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Long> lastRightClicks = new ConcurrentHashMap<>();
 
     @Override
@@ -73,6 +75,15 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     public void onDisable() {
         Bukkit.removeRecipe(new NamespacedKey(this, "lightning_crowbar"));
         Bukkit.removeRecipe(new NamespacedKey(this, "nail_brick"));
+        adjustmentTasks.values().forEach(ScheduledTask::cancel);
+        adjustmentTasks.clear();
+        for (Map.Entry<UUID, AnchorState> entry : anchors.entrySet()) {
+            Player player = Bukkit.getPlayer(entry.getKey());
+            if (player != null) {
+                player.setGravity(entry.getValue().originalGravity);
+                clearVelocity(player);
+            }
+        }
         anchors.clear();
         inputStates.clear();
         lastRightClicks.clear();
@@ -171,6 +182,10 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
                 && state.mode == AnchorMode.ADJUSTING) {
             event.setCancelled(true);
             state.mode = AnchorMode.FIXED;
+            cancelAdjustmentTask(event.getPlayer().getUniqueId());
+            state.location = anchorView(state.location, event.getPlayer().getLocation());
+            event.getPlayer().setGravity(false);
+            clearVelocity(event.getPlayer());
             event.getPlayer().sendMessage(Component.text("调整完成，已重新固定。", NamedTextColor.GREEN));
         }
     }
@@ -184,11 +199,15 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
         AnchorState state = anchors.get(player.getUniqueId());
         if (state == null) {
-            anchors.put(player.getUniqueId(), new AnchorState(player.getLocation()));
+            AnchorState newState = new AnchorState(player.getLocation(), player.hasGravity());
+            anchors.put(player.getUniqueId(), newState);
+            player.setGravity(false);
+            clearVelocity(player);
             inputStates.put(player.getUniqueId(), InputState.from(player.getCurrentInput()));
             player.sendMessage(Component.text("已固定当前位置。再次右键钉砖进入调整模式。", NamedTextColor.GREEN));
         } else if (state.mode == AnchorMode.FIXED) {
             state.mode = AnchorMode.ADJUSTING;
+            startAdjustmentTask(player, state);
             player.sendMessage(Component.text(
                     "已进入调整模式：普通移动微调 0.05 格，冲刺移动大调 0.5 格；W/S 前后、A/D 左右，跳跃上移，Shift 下移；左键完成。",
                     NamedTextColor.YELLOW));
@@ -199,7 +218,6 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     public void onPlayerInput(PlayerInputEvent event) {
         Player player = event.getPlayer();
         UUID playerId = player.getUniqueId();
-        InputState previous = inputStates.getOrDefault(playerId, InputState.EMPTY);
         InputState current = InputState.from(event.getInput());
         inputStates.put(playerId, current);
 
@@ -210,14 +228,8 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
         if (state.mode == AnchorMode.FIXED) {
             if (current.movementActive()) {
-                anchors.remove(playerId, state);
-                player.sendMessage(Component.text("你已使用移动键，固定状态已解除。", NamedTextColor.YELLOW));
+                releaseAnchor(player, state, true);
             }
-            return;
-        }
-
-        if (state.mode == AnchorMode.ADJUSTING) {
-            adjustFromInput(state, previous, current, player);
         }
     }
 
@@ -234,11 +246,11 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
             return;
         }
 
-        InputState input = inputStates.getOrDefault(playerId, InputState.EMPTY);
+        InputState input = InputState.from(event.getPlayer().getCurrentInput());
+        inputStates.put(playerId, input);
         if (state.mode == AnchorMode.FIXED) {
             if (input.movementActive()) {
-                anchors.remove(playerId, state);
-                event.getPlayer().sendMessage(Component.text("你已使用移动键，固定状态已解除。", NamedTextColor.YELLOW));
+                releaseAnchor(event.getPlayer(), state, true);
                 return;
             }
 
@@ -247,8 +259,10 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
                 return;
             }
 
-            event.setTo(anchorView(state.location, to));
-            event.getPlayer().setVelocity(new Vector());
+            if (!samePosition(to, state.location)) {
+                event.setTo(anchorView(state.location, to));
+                clearVelocity(event.getPlayer());
+            }
             return;
         }
 
@@ -262,24 +276,61 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         AnchorState state = anchors.get(event.getPlayer().getUniqueId());
         InputState input = inputStates.getOrDefault(event.getPlayer().getUniqueId(), InputState.EMPTY);
         if (state != null && state.mode == AnchorMode.FIXED && !input.movementActive()) {
-            event.setVelocity(new Vector());
+            if (event.getVelocity().lengthSquared() > POSITION_EPSILON) {
+                event.setVelocity(new Vector());
+            }
         }
     }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         UUID playerId = event.getPlayer().getUniqueId();
-        anchors.remove(playerId);
+        AnchorState state = anchors.remove(playerId);
+        cancelAdjustmentTask(playerId);
+        if (state != null) {
+            event.getPlayer().setGravity(state.originalGravity);
+        }
         inputStates.remove(playerId);
         lastRightClicks.remove(playerId);
     }
 
     @EventHandler
     public void onPlayerDeath(PlayerDeathEvent event) {
-        anchors.remove(event.getEntity().getUniqueId());
+        UUID playerId = event.getEntity().getUniqueId();
+        AnchorState state = anchors.remove(playerId);
+        cancelAdjustmentTask(playerId);
+        if (state != null) {
+            event.getEntity().setGravity(state.originalGravity);
+        }
+        inputStates.remove(playerId);
     }
 
-    private void adjustFromInput(AnchorState state, InputState previous, InputState current, Player player) {
+    private void startAdjustmentTask(Player player, AnchorState state) {
+        UUID playerId = player.getUniqueId();
+        cancelAdjustmentTask(playerId);
+        ScheduledTask task = player.getScheduler().runAtFixedRate(this, scheduledTask -> {
+            AnchorState activeState = anchors.get(playerId);
+            if (activeState != state || activeState.mode != AnchorMode.ADJUSTING || !player.isOnline()) {
+                scheduledTask.cancel();
+                adjustmentTasks.remove(playerId, scheduledTask);
+                return;
+            }
+
+            InputState current = InputState.from(player.getCurrentInput());
+            inputStates.put(playerId, current);
+            adjustFromInput(activeState, current, player);
+        }, () -> adjustmentTasks.remove(playerId), 1L, 1L);
+        adjustmentTasks.put(playerId, task);
+    }
+
+    private void cancelAdjustmentTask(UUID playerId) {
+        ScheduledTask task = adjustmentTasks.remove(playerId);
+        if (task != null) {
+            task.cancel();
+        }
+    }
+
+    private void adjustFromInput(AnchorState state, InputState current, Player player) {
         double step = current.sprint ? LARGE_STEP : FINE_STEP;
         float yaw = player.getLocation().getYaw();
         double yawRadians = Math.toRadians(yaw);
@@ -291,26 +342,26 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         double moveY = 0;
         double moveZ = 0;
 
-        if (current.forward && !previous.forward) {
+        if (current.forward) {
             moveX += forwardX * step;
             moveZ += forwardZ * step;
         }
-        if (current.backward && !previous.backward) {
+        if (current.backward) {
             moveX -= forwardX * step;
             moveZ -= forwardZ * step;
         }
-        if (current.right && !previous.right) {
+        if (current.right) {
             moveX += rightX * step;
             moveZ += rightZ * step;
         }
-        if (current.left && !previous.left) {
+        if (current.left) {
             moveX -= rightX * step;
             moveZ -= rightZ * step;
         }
-        if (current.jump && !previous.jump) {
+        if (current.jump) {
             moveY += step;
         }
-        if (current.sneak && !previous.sneak) {
+        if (current.sneak) {
             moveY -= step;
         }
         if (moveX == 0 && moveY == 0 && moveZ == 0) {
@@ -318,7 +369,27 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         }
 
         state.location = offset(state.location, moveX, moveY, moveZ, player.getLocation());
-        player.teleportAsync(state.location.clone());
+        player.teleport(state.location.clone());
+    }
+
+    private void releaseAnchor(Player player, AnchorState state, boolean notify) {
+        if (!anchors.remove(player.getUniqueId(), state)) {
+            return;
+        }
+
+        cancelAdjustmentTask(player.getUniqueId());
+        player.setGravity(state.originalGravity);
+        clearVelocity(player);
+        inputStates.remove(player.getUniqueId());
+        if (notify) {
+            player.sendMessage(Component.text("你已使用移动键，固定状态已解除。", NamedTextColor.YELLOW));
+        }
+    }
+
+    private void clearVelocity(Player player) {
+        if (player.getVelocity().lengthSquared() > POSITION_EPSILON) {
+            player.setVelocity(new Vector());
+        }
     }
 
     private Location offset(Location source, double x, double y, double z, Location view) {
@@ -410,9 +481,11 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     private static final class AnchorState {
         private Location location;
         private AnchorMode mode = AnchorMode.FIXED;
+        private final boolean originalGravity;
 
-        private AnchorState(Location location) {
+        private AnchorState(Location location, boolean originalGravity) {
             this.location = location.clone();
+            this.originalGravity = originalGravity;
         }
     }
 
