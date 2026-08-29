@@ -17,14 +17,19 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerInputEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.event.player.PlayerToggleSneakEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.event.player.PlayerVelocityEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.ShapedRecipe;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.Input;
+import org.bukkit.util.Vector;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 
@@ -46,6 +51,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     private NamespacedKey crowbarKey;
     private NamespacedKey nailBrickKey;
     private final Map<UUID, AnchorState> anchors = new ConcurrentHashMap<>();
+    private final Map<UUID, InputState> inputStates = new ConcurrentHashMap<>();
     private final Map<UUID, Long> lastRightClicks = new ConcurrentHashMap<>();
 
     @Override
@@ -68,6 +74,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         Bukkit.removeRecipe(new NamespacedKey(this, "lightning_crowbar"));
         Bukkit.removeRecipe(new NamespacedKey(this, "nail_brick"));
         anchors.clear();
+        inputStates.clear();
         lastRightClicks.clear();
     }
 
@@ -178,6 +185,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         AnchorState state = anchors.get(player.getUniqueId());
         if (state == null) {
             anchors.put(player.getUniqueId(), new AnchorState(player.getLocation()));
+            inputStates.put(player.getUniqueId(), InputState.from(player.getCurrentInput()));
             player.sendMessage(Component.text("已固定当前位置。再次右键钉砖进入调整模式。", NamedTextColor.GREEN));
         } else if (state.mode == AnchorMode.FIXED) {
             state.mode = AnchorMode.ADJUSTING;
@@ -188,10 +196,35 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     }
 
     @EventHandler(priority = EventPriority.NORMAL, ignoreCancelled = true)
+    public void onPlayerInput(PlayerInputEvent event) {
+        Player player = event.getPlayer();
+        UUID playerId = player.getUniqueId();
+        InputState previous = inputStates.getOrDefault(playerId, InputState.EMPTY);
+        InputState current = InputState.from(event.getInput());
+        inputStates.put(playerId, current);
+
+        AnchorState state = anchors.get(playerId);
+        if (state == null) {
+            return;
+        }
+
+        if (state.mode == AnchorMode.FIXED) {
+            if (current.movementActive()) {
+                anchors.remove(playerId, state);
+                player.sendMessage(Component.text("你已使用移动键，固定状态已解除。", NamedTextColor.YELLOW));
+            }
+            return;
+        }
+
+        if (state.mode == AnchorMode.ADJUSTING) {
+            adjustFromInput(state, previous, current, player);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onPlayerMove(PlayerMoveEvent event) {
-        Location from = event.getFrom();
         Location to = event.getTo();
-        if (to == null || !hasPositionChanged(from, to)) {
+        if (to == null) {
             return;
         }
 
@@ -201,83 +234,91 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
             return;
         }
 
-        if (state.pendingTeleport) {
-            state.pendingTeleport = false;
-            event.setTo(state.location.clone());
-            return;
-        }
-
+        InputState input = inputStates.getOrDefault(playerId, InputState.EMPTY);
         if (state.mode == AnchorMode.FIXED) {
-            anchors.remove(playerId, state);
-            event.getPlayer().sendMessage(Component.text("你已移动，固定状态已解除。", NamedTextColor.YELLOW));
+            if (input.movementActive()) {
+                anchors.remove(playerId, state);
+                event.getPlayer().sendMessage(Component.text("你已使用移动键，固定状态已解除。", NamedTextColor.YELLOW));
+                return;
+            }
+
+            if (event instanceof PlayerTeleportEvent) {
+                event.setCancelled(true);
+                return;
+            }
+
+            event.setTo(anchorView(state.location, to));
+            event.getPlayer().setVelocity(new Vector());
             return;
         }
 
-        Location adjusted = adjustedLocation(state.location, from, to, event.getPlayer());
-        if (adjusted == null) {
-            event.setTo(state.location.clone());
-            return;
+        if (state.mode == AnchorMode.ADJUSTING && !samePosition(to, state.location)) {
+            event.setTo(anchorView(state.location, to));
         }
-
-        state.location = adjusted;
-        event.setTo(adjusted.clone());
     }
 
-    @EventHandler(priority = EventPriority.NORMAL, ignoreCancelled = true)
-    public void onToggleSneak(PlayerToggleSneakEvent event) {
-        if (!event.isSneaking() || !(anchors.get(event.getPlayer().getUniqueId()) instanceof AnchorState state)
-                || state.mode != AnchorMode.ADJUSTING) {
-            return;
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onPlayerVelocity(PlayerVelocityEvent event) {
+        AnchorState state = anchors.get(event.getPlayer().getUniqueId());
+        InputState input = inputStates.getOrDefault(event.getPlayer().getUniqueId(), InputState.EMPTY);
+        if (state != null && state.mode == AnchorMode.FIXED && !input.movementActive()) {
+            event.setVelocity(new Vector());
         }
-
-        double step = adjustmentStep(event.getPlayer());
-        state.location = offset(state.location, 0, -step, 0, event.getPlayer().getLocation());
-        state.pendingTeleport = true;
-        event.getPlayer().teleportAsync(state.location.clone());
     }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         UUID playerId = event.getPlayer().getUniqueId();
         anchors.remove(playerId);
+        inputStates.remove(playerId);
         lastRightClicks.remove(playerId);
     }
 
-    private Location adjustedLocation(Location anchor, Location from, Location to, Player player) {
-        double dx = to.getX() - from.getX();
-        double dy = to.getY() - from.getY();
-        double dz = to.getZ() - from.getZ();
-        double step = adjustmentStep(player);
+    @EventHandler
+    public void onPlayerDeath(PlayerDeathEvent event) {
+        anchors.remove(event.getEntity().getUniqueId());
+    }
 
-        float yaw = to.getYaw();
+    private void adjustFromInput(AnchorState state, InputState previous, InputState current, Player player) {
+        double step = current.sprint ? LARGE_STEP : FINE_STEP;
+        float yaw = player.getLocation().getYaw();
         double yawRadians = Math.toRadians(yaw);
         double forwardX = -Math.sin(yawRadians);
         double forwardZ = Math.cos(yawRadians);
         double rightX = Math.cos(yawRadians);
         double rightZ = Math.sin(yawRadians);
-
-        double forwardInput = dx * forwardX + dz * forwardZ;
-        double rightInput = dx * rightX + dz * rightZ;
         double moveX = 0;
         double moveY = 0;
         double moveZ = 0;
-        if (Math.abs(forwardInput) > POSITION_EPSILON) {
-            double direction = Math.signum(forwardInput);
-            moveX += forwardX * direction * step;
-            moveZ += forwardZ * direction * step;
+
+        if (current.forward && !previous.forward) {
+            moveX += forwardX * step;
+            moveZ += forwardZ * step;
         }
-        if (Math.abs(rightInput) > POSITION_EPSILON) {
-            double direction = Math.signum(rightInput);
-            moveX += rightX * direction * step;
-            moveZ += rightZ * direction * step;
+        if (current.backward && !previous.backward) {
+            moveX -= forwardX * step;
+            moveZ -= forwardZ * step;
         }
-        if (Math.abs(dy) > POSITION_EPSILON) {
-            moveY = Math.signum(dy) * step;
+        if (current.right && !previous.right) {
+            moveX += rightX * step;
+            moveZ += rightZ * step;
+        }
+        if (current.left && !previous.left) {
+            moveX -= rightX * step;
+            moveZ -= rightZ * step;
+        }
+        if (current.jump && !previous.jump) {
+            moveY += step;
+        }
+        if (current.sneak && !previous.sneak) {
+            moveY -= step;
         }
         if (moveX == 0 && moveY == 0 && moveZ == 0) {
-            return null;
+            return;
         }
-        return offset(anchor, moveX, moveY, moveZ, to);
+
+        state.location = offset(state.location, moveX, moveY, moveZ, player.getLocation());
+        player.teleportAsync(state.location.clone());
     }
 
     private Location offset(Location source, double x, double y, double z, Location view) {
@@ -287,14 +328,18 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         return result;
     }
 
-    private double adjustmentStep(Player player) {
-        return player.isSprinting() ? LARGE_STEP : FINE_STEP;
+    private Location anchorView(Location anchor, Location view) {
+        Location result = anchor.clone();
+        result.setYaw(view.getYaw());
+        result.setPitch(view.getPitch());
+        return result;
     }
 
-    private boolean hasPositionChanged(Location from, Location to) {
-        return Math.abs(from.getX() - to.getX()) > POSITION_EPSILON
-                || Math.abs(from.getY() - to.getY()) > POSITION_EPSILON
-                || Math.abs(from.getZ() - to.getZ()) > POSITION_EPSILON;
+    private boolean samePosition(Location first, Location second) {
+        return first.getWorld() == second.getWorld()
+                && Math.abs(first.getX() - second.getX()) <= POSITION_EPSILON
+                && Math.abs(first.getY() - second.getY()) <= POSITION_EPSILON
+                && Math.abs(first.getZ() - second.getZ()) <= POSITION_EPSILON;
     }
 
     @Override
@@ -365,10 +410,47 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     private static final class AnchorState {
         private Location location;
         private AnchorMode mode = AnchorMode.FIXED;
-        private boolean pendingTeleport;
 
         private AnchorState(Location location) {
             this.location = location.clone();
+        }
+    }
+
+    private static final class InputState {
+        private static final InputState EMPTY = new InputState(false, false, false, false, false, false, false);
+
+        private final boolean forward;
+        private final boolean backward;
+        private final boolean left;
+        private final boolean right;
+        private final boolean jump;
+        private final boolean sneak;
+        private final boolean sprint;
+
+        private InputState(boolean forward, boolean backward, boolean left, boolean right,
+                           boolean jump, boolean sneak, boolean sprint) {
+            this.forward = forward;
+            this.backward = backward;
+            this.left = left;
+            this.right = right;
+            this.jump = jump;
+            this.sneak = sneak;
+            this.sprint = sprint;
+        }
+
+        private static InputState from(Input input) {
+            return new InputState(
+                    input.isForward(),
+                    input.isBackward(),
+                    input.isLeft(),
+                    input.isRight(),
+                    input.isJump(),
+                    input.isSneak(),
+                    input.isSprint());
+        }
+
+        private boolean movementActive() {
+            return forward || backward || left || right || jump || sneak;
         }
     }
 }
