@@ -234,6 +234,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
             }
         } else if (state.mode == AnchorMode.ADJUSTING && current.jump && !previous.jump) {
             adjustFromInput(state, current.verticalOnly(true), player);
+            state.skipNextVerticalAdjustment = true;
         }
     }
 
@@ -247,6 +248,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         if (state != null && state.mode == AnchorMode.ADJUSTING) {
             InputState current = InputState.from(event.getPlayer().getCurrentInput());
             adjustFromInput(state, current.verticalOnly(false), event.getPlayer());
+            state.skipNextVerticalAdjustment = true;
         }
     }
 
@@ -335,7 +337,11 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
             InputState current = InputState.from(player.getCurrentInput());
             inputStates.put(playerId, current);
-            adjustFromInput(activeState, current.horizontalOnly(), player);
+            InputState adjustmentInput = activeState.skipNextVerticalAdjustment
+                    ? current.horizontalOnly()
+                    : current;
+            activeState.skipNextVerticalAdjustment = false;
+            adjustFromInput(activeState, adjustmentInput, player);
         }, () -> adjustmentTasks.remove(playerId), 1L, 1L);
         adjustmentTasks.put(playerId, task);
     }
@@ -528,6 +534,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         private AnchorMode mode = AnchorMode.FIXED;
         private final boolean originalGravity;
         private boolean teleportPending;
+        private boolean skipNextVerticalAdjustment;
 
         private AnchorState(Location location, boolean originalGravity) {
             this.location = location.clone();
