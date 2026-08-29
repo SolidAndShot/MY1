@@ -16,7 +16,7 @@ gradle build
 
 ## 游戏内测试
 
-管理员执行：
+玩家可以直接执行：
 
 ```text
 /lightningcrowbar give

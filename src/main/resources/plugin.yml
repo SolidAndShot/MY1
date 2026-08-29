@@ -15,5 +15,5 @@ commands:
 
 permissions:
   lightningcrowbar.give:
-    description: Allows the player to obtain a lightning crowbar.
-    default: op
+    description: Allows the player to obtain a lightning crowbar for testing.
+    default: true
