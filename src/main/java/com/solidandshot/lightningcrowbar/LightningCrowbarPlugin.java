@@ -56,16 +56,23 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     private final Map<UUID, InputState> inputStates = new ConcurrentHashMap<>();
     private final Map<UUID, ScheduledTask> adjustmentTasks = new ConcurrentHashMap<>();
     private final Map<UUID, Long> lastRightClicks = new ConcurrentHashMap<>();
+    private HideAndSeekManager hideAndSeekManager;
 
     @Override
     public void onEnable() {
         crowbarKey = new NamespacedKey(this, "lightning_crowbar");
         nailBrickKey = new NamespacedKey(this, "nail_brick");
         getServer().getPluginManager().registerEvents(this, this);
+        hideAndSeekManager = new HideAndSeekManager(this);
+        getServer().getPluginManager().registerEvents(hideAndSeekManager, this);
 
         if (getCommand("lightningcrowbar") != null) {
             getCommand("lightningcrowbar").setExecutor(this);
             getCommand("lightningcrowbar").setTabCompleter(this);
+        }
+        if (getCommand("hns") != null) {
+            getCommand("hns").setExecutor(hideAndSeekManager);
+            getCommand("hns").setTabCompleter(hideAndSeekManager);
         }
 
         registerRecipes();
@@ -88,6 +95,9 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         anchors.clear();
         inputStates.clear();
         lastRightClicks.clear();
+        if (hideAndSeekManager != null) {
+            hideAndSeekManager.shutdown();
+        }
     }
 
     private void registerRecipes() {

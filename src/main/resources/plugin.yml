@@ -7,6 +7,12 @@ author: SolidAndShot
 description: A Folia-compatible crowbar that calls lightning when it hits a living entity.
 
 commands:
+  hns:
+    description: Controls the 10-minute hide-and-seek game.
+    usage: /hns <admin|start|stop|randomize|setrole|test|kit|status>
+    aliases: [hidenseek]
+    permission: lightningcrowbar.hns
+
   lightningcrowbar:
     description: Gives plugin items.
     usage: /lightningcrowbar give [player] or /lightningcrowbar givebrick [player]
@@ -14,6 +20,9 @@ commands:
     permission: lightningcrowbar.give
 
 permissions:
+  lightningcrowbar.hns:
+    description: Allows the player to control hide-and-seek games.
+    default: op
   lightningcrowbar.give:
     description: Allows the player to obtain a lightning crowbar for testing.
     default: true
