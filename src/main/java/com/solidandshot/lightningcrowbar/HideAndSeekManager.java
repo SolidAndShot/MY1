@@ -1059,7 +1059,8 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                 }
             }
         } else if (kind.equals("small_firecracker")) {
-            processFirecrackerImpact(projectile.getLocation());
+            Player thrower = projectile.getShooter() instanceof Player player ? player : null;
+            processFirecrackerImpact(projectile.getLocation(), thrower);
         } else if (kind.equals("tracking")) {
             Entity hit = event.getHitEntity();
             if (hit instanceof Player player && roles.get(player.getUniqueId()) == Role.HIDER) {
@@ -1069,7 +1070,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         projectile.remove();
     }
 
-    private void processFirecrackerImpact(Location impact) {
+    private void processFirecrackerImpact(Location impact, Player thrower) {
         for (Player target : new ArrayList<>(Bukkit.getOnlinePlayers())) {
             Location targetLocation = lastLocations.get(target.getUniqueId());
             if (roles.get(target.getUniqueId()) != Role.HIDER || targetLocation == null
@@ -1079,6 +1080,9 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             }
             UUID targetId = target.getUniqueId();
             int hit = firecrackerHits.merge(targetId, 1, Integer::sum);
+            if (thrower != null) {
+                lastHiderAttackers.put(targetId, thrower.getUniqueId());
+            }
             target.getScheduler().run(plugin, task -> applyFirecrackerHit(target, hit), () -> { });
         }
     }
