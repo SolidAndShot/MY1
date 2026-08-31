@@ -1080,14 +1080,12 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             }
             UUID targetId = target.getUniqueId();
             int hit = firecrackerHits.merge(targetId, 1, Integer::sum);
-            if (thrower != null) {
-                lastHiderAttackers.put(targetId, thrower.getUniqueId());
-            }
-            target.getScheduler().run(plugin, task -> applyFirecrackerHit(target, hit), () -> { });
+            UUID throwerId = thrower == null ? null : thrower.getUniqueId();
+            target.getScheduler().run(plugin, task -> applyFirecrackerHit(target, hit, throwerId), () -> { });
         }
     }
 
-    private void applyFirecrackerHit(Player target, int hit) {
+    private void applyFirecrackerHit(Player target, int hit, UUID throwerId) {
         if (phase != GamePhase.RUNNING || roles.get(target.getUniqueId()) != Role.HIDER) {
             return;
         }
@@ -1104,6 +1102,12 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             target.sendMessage(Component.text("小摔炮再次命中：水滴效果持续 5 秒。", NamedTextColor.AQUA));
         } else {
             firecrackerHits.remove(target.getUniqueId());
+            boolean lethal = target.getHealth() <= 10.0;
+            if (lethal && throwerId != null) {
+                lastHiderAttackers.put(target.getUniqueId(), throwerId);
+            } else {
+                lastHiderAttackers.remove(target.getUniqueId());
+            }
             target.setHealth(Math.max(0.0, target.getHealth() - 10.0));
             target.playSound(target.getLocation(), Sound.ENTITY_SILVERFISH_HURT,
                     SoundCategory.PLAYERS, 1.0f, 1.0f);
