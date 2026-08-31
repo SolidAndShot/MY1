@@ -11,6 +11,7 @@ import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.SoundCategory;
 import org.bukkit.World;
@@ -88,6 +89,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     private static final double TRACKING_BULLET_SPEED = 0.16;
     private static final long WHISTLE_COOLDOWN_MILLIS = 20_000L;
     private static final long REVEAL_MILLIS = 5_000L;
+    private static final long FIRECRACKER_EFFECT_MILLIS = 5_000L;
     private static final int MIN_EVENT_INTERVAL_SECONDS = 15;
     private static final int MAX_SLOW_AMPLIFIER = 10;
     private static final double[] MAX_HIDER_SCALES = {0.55, 0.83, 1.11, 1.66};
@@ -102,19 +104,23 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     private final Map<UUID, Location> lastLocations = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> swordHits = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> bowHits = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> firecrackerHits = new ConcurrentHashMap<>();
     private final Map<UUID, UUID> lastHiderAttackers = new ConcurrentHashMap<>();
     private final Set<UUID> pendingConversion = ConcurrentHashMap.newKeySet();
     private final Map<UUID, ScheduledTask> revealTasks = new ConcurrentHashMap<>();
+    private final Map<UUID, ScheduledTask> firecrackerParticleTasks = new ConcurrentHashMap<>();
     private final Set<UUID> gameEntities = ConcurrentHashMap.newKeySet();
     private final double[] hiderScales = HIDER_SCALES.clone();
     private final int[] scaleThresholds = SCALE_THRESHOLDS.clone();
     private final Map<RandomEventType, Boolean> randomEventEnabled = new ConcurrentHashMap<>();
+    private final Map<String, Boolean> itemGiveEnabled = new ConcurrentHashMap<>();
 
     private NamespacedKey itemKey;
     private NamespacedKey levelKey;
     private NamespacedKey projectileKey;
     private NamespacedKey targetKey;
     private NamespacedKey nailBrickKey;
+    private NamespacedKey firecrackerKey;
     private ScheduledTask gameTask;
     private volatile GamePhase phase = GamePhase.WAITING;
     private volatile long startedAtMillis;
@@ -138,10 +144,15 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         projectileKey = new NamespacedKey(plugin, "hns_projectile");
         targetKey = new NamespacedKey(plugin, "hns_target");
         nailBrickKey = new NamespacedKey(plugin, "nail_brick");
+        firecrackerKey = new NamespacedKey(plugin, "hns_firecracker");
+        for (ItemGrant grant : ItemGrant.values()) {
+            itemGiveEnabled.put(grant.configKey, true);
+        }
         for (RandomEventType type : RandomEventType.values()) {
             randomEventEnabled.put(type, true);
         }
         loadGameConfig();
+        saveGameConfig();
         gameTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, task -> tickGame(), 1L, 20L);
     }
 
@@ -154,6 +165,10 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             task.cancel();
         }
         revealTasks.clear();
+        for (ScheduledTask task : firecrackerParticleTasks.values()) {
+            task.cancel();
+        }
+        firecrackerParticleTasks.clear();
         stopGame(null, false);
         saveGameConfig();
     }
@@ -270,6 +285,9 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             addEffect(player, PotionEffectType.SLOWNESS,
                     Math.max(hiderSlowAmplifier, state.eventSlowAmplifier));
         }
+        if (state.firecrackerSlowUntil > now) {
+            addEffect(player, PotionEffectType.SLOWNESS, Math.max(hiderSlowAmplifier, 4));
+        }
         if (state.eventSpeedUntil > now) {
             addEffect(player, PotionEffectType.SPEED, Math.max(4, state.eventSpeedAmplifier));
         }
@@ -359,6 +377,13 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         randomEventIntervalSeconds = Math.max(MIN_EVENT_INTERVAL_SECONDS,
                 Math.min((int) ROUND_SECONDS, root.getInt("random-events.interval-seconds", randomEventIntervalSeconds)));
         radarMode = parseRadarMode(root.getString("radar.mode"), radarMode);
+        ConfigurationSection items = root.getConfigurationSection("items");
+        if (items != null) {
+            for (ItemGrant grant : ItemGrant.values()) {
+                itemGiveEnabled.put(grant.configKey,
+                        items.getBoolean(grant.configKey, itemGiveEnabled.getOrDefault(grant.configKey, true)));
+            }
+        }
         ConfigurationSection events = root.getConfigurationSection("random-events.events");
         if (events != null) {
             for (RandomEventType type : RandomEventType.values()) {
@@ -385,6 +410,10 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                     randomEventEnabled.getOrDefault(type, true));
         }
         plugin.getConfig().set("hns.radar.mode", radarMode.name());
+        for (ItemGrant grant : ItemGrant.values()) {
+            plugin.getConfig().set("hns.items." + grant.configKey,
+                    itemGiveEnabled.getOrDefault(grant.configKey, true));
+        }
         plugin.saveConfig();
     }
 
@@ -521,6 +550,9 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         if (value == null) {
             return fallback;
         }
+        if (value.equalsIgnoreCase("CUBE_10")) {
+            return RadarMode.SQUARE_10;
+        }
         try {
             return RadarMode.valueOf(value.toUpperCase(Locale.ROOT));
         } catch (IllegalArgumentException ignored) {
@@ -543,13 +575,42 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             admin.sendMessage(Component.text("你没有躲猫猫管理权限。", NamedTextColor.RED));
             return;
         }
-        admin.openInventory(createAdminInventory());
+        admin.openInventory(createAdminInventory(AdminMenuPage.MAIN));
     }
 
     private Inventory createAdminInventory() {
-        AdminMenuHolder holder = new AdminMenuHolder();
-        Inventory inventory = Bukkit.createInventory(holder, 54, Component.text("躲猫猫控制台"));
+        return createAdminInventory(AdminMenuPage.MAIN);
+    }
+
+    private Inventory createAdminInventory(AdminMenuPage page) {
+        AdminMenuHolder holder = new AdminMenuHolder(page);
+        Inventory inventory = Bukkit.createInventory(holder, 54, Component.text(page.title));
         holder.inventory = inventory;
+        switch (page) {
+            case MAIN -> createMainMenu(inventory);
+            case GAME -> createGameMenu(inventory);
+            case PLAYERS -> createPlayersMenu(inventory);
+            case RULES -> createRulesMenu(inventory);
+            case HIDER_ITEMS -> createItemMenu(inventory, false);
+            case HUNTER_ITEMS -> createItemMenu(inventory, true);
+            case RADAR_EVENTS -> createRadarEventsMenu(inventory);
+        }
+        return inventory;
+    }
+
+    private void createMainMenu(Inventory inventory) {
+        inventory.setItem(10, menuItem(Material.LIME_WOOL, "游戏控制", "menu_game"));
+        inventory.setItem(12, menuItem(Material.PLAYER_HEAD, "玩家与角色", "menu_players"));
+        inventory.setItem(14, menuItem(Material.SPYGLASS, "规则与体型", "menu_rules"));
+        inventory.setItem(16, menuItem(Material.BRICK, "躲藏者道具发放", "menu_hider_items"));
+        inventory.setItem(28, menuItem(Material.NETHERITE_SWORD, "抓捕者道具发放", "menu_hunter_items"));
+        inventory.setItem(30, menuItem(Material.COMPASS, "雷达与随机事件", "menu_radar_events"));
+        inventory.setItem(22, ComponentItem(Material.PAPER, "状态：" + phaseText(),
+                "剩余时间：" + formatRemaining(), "躲藏者：" + hiderCount(), "上局：" + lastResult));
+        inventory.setItem(49, menuItem(Material.BARRIER, "关闭", "close_menu"));
+    }
+
+    private void createGameMenu(Inventory inventory) {
         inventory.setItem(10, menuItem(Material.LIME_WOOL, "开始 10 分钟游戏", "start"));
         inventory.setItem(11, menuItem(Material.RED_WOOL, "停止游戏", "stop"));
         inventory.setItem(12, menuItem(Material.CLOCK, "刷新状态", "status"));
@@ -557,67 +618,88 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         inventory.setItem(14, menuItem(Material.CHEST, "发放当前角色道具", "kit"));
         inventory.setItem(15, menuItem(Material.REPEATER, "单人测试：躲藏者", "test_hider"));
         inventory.setItem(16, menuItem(Material.TARGET, "单人测试：抓捕者", "test_hunter"));
-        inventory.setItem(0, menuItem(Material.CLOCK,
-                "体型节点 1：" + formatDuration(scaleThresholds[1]), "scale_time_1"));
-        inventory.setItem(1, menuItem(Material.CLOCK,
-                "体型节点 2：" + formatDuration(scaleThresholds[2]), "scale_time_2"));
-        inventory.setItem(2, menuItem(Material.CLOCK,
-                "体型节点 3：" + formatDuration(scaleThresholds[3]), "scale_time_3"));
-        inventory.setItem(22, ComponentItem(Material.PAPER, "状态：" + phaseText(),
-                "剩余时间：" + formatRemaining(), "躲藏者：" + hiderCount(), "上局：" + lastResult));
         inventory.setItem(19, menuItem(Material.REDSTONE_TORCH, "时间 -30 秒", "time_minus_30"));
         inventory.setItem(20, menuItem(Material.CLOCK, "时间 +30 秒", "time_plus_30"));
         inventory.setItem(21, menuItem(Material.COPPER_BLOCK, "跳到 3 分钟", "time_180"));
-        inventory.setItem(23, menuItem(Material.IRON_BLOCK, "跳到 5 分钟", "time_300"));
-        inventory.setItem(24, menuItem(Material.NETHERITE_BLOCK, "跳到 8 分钟", "time_480"));
+        inventory.setItem(22, menuItem(Material.IRON_BLOCK, "跳到 5 分钟", "time_300"));
+        inventory.setItem(23, menuItem(Material.NETHERITE_BLOCK, "跳到 8 分钟", "time_480"));
         inventory.setItem(25, menuItem(Material.GOLDEN_SWORD, "强制抓捕者胜利", "win_hunter"));
         inventory.setItem(26, menuItem(Material.GOLDEN_APPLE, "强制躲藏者胜利", "win_hider"));
-        inventory.setItem(39, ComponentItem(Material.SPYGLASS,
-                "体型阶段 " + (selectedScaleStage + 1) + " / 4",
-                "当前倍率：" + formatScale(hiderScales[selectedScaleStage]),
-                "约高：" + displayHiderHeight(selectedScaleStage) + " 格",
-                "点击下方按钮调整，阶段按钮切换"));
-        inventory.setItem(40, menuItem(Material.RED_CONCRETE, "体型倍率 -0.01", "scale_minus"));
-        inventory.setItem(41, menuItem(Material.GREEN_CONCRETE, "体型倍率 +0.01", "scale_plus"));
-        inventory.setItem(42, menuItem(Material.CLOCK, "切换体型阶段", "scale_stage_next"));
-        inventory.setItem(43, ComponentItem(Material.POTION,
-                "躲藏者缓慢配置",
-                "触发：" + formatDuration(hiderSlowTriggerSeconds),
-                "等级：缓慢 " + (hiderSlowAmplifier + 1),
-                "点击按钮循环调整"));
-        inventory.setItem(44, menuItem(Material.REPEATER, "缓慢触发时间 +30秒", "slow_time_next"));
-        inventory.setItem(45, menuItem(Material.REDSTONE, "缓慢等级 +1", "slow_amp_next"));
-        inventory.setItem(46, menuItem(Material.COMPASS, "雷达模式：" + radarModeText(), "radar_mode"));
-        inventory.setItem(47, menuItem(randomEventsEnabled ? Material.LIME_WOOL : Material.GRAY_WOOL,
-                "随机事件：" + (randomEventsEnabled ? "开启" : "关闭"), "events_toggle"));
-        inventory.setItem(48, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HIDER_REVEAL, true)
-                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
-                "事件：全体暴露 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HIDER_REVEAL, true)),
-                "event_toggle_" + RandomEventType.HIDER_REVEAL.configKey));
-        inventory.setItem(49, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HIDER_SLOW, true)
-                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
-                "事件：躲藏者减速 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HIDER_SLOW, true)),
-                "event_toggle_" + RandomEventType.HIDER_SLOW.configKey));
-        inventory.setItem(50, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HUNTER_HASTE, true)
-                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
-                "事件：抓捕者加速 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HUNTER_HASTE, true)),
-                "event_toggle_" + RandomEventType.HUNTER_HASTE.configKey));
-        inventory.setItem(51, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HIDER_BOOST, true)
-                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
-                "事件：躲藏者加速 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HIDER_BOOST, true)),
-                "event_toggle_" + RandomEventType.HIDER_BOOST.configKey));
-        inventory.setItem(52, menuItem(Material.DAYLIGHT_DETECTOR,
-                "事件触发：" + randomEventModeText(), "events_mode"));
-        inventory.setItem(53, menuItem(Material.CLOCK,
-                "事件间隔 +15秒（当前 " + randomEventIntervalSeconds + "）", "events_interval_next"));
+        inventory.setItem(31, ComponentItem(Material.PAPER, "状态：" + phaseText(),
+                "剩余时间：" + formatRemaining(), "躲藏者：" + hiderCount(), "上局：" + lastResult));
+        addBackButton(inventory);
+    }
 
+    private void createPlayersMenu(Inventory inventory) {
         List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
         players.sort(Comparator.comparing(Player::getName, String.CASE_INSENSITIVE_ORDER));
         for (int i = 0; i < players.size() && i < 12; i++) {
-            Player player = players.get(i);
-            inventory.setItem(27 + i, playerHead(player));
+            inventory.setItem(10 + i, playerHead(players.get(i)));
         }
-        return inventory;
+        inventory.setItem(31, ComponentItem(Material.PLAYER_HEAD, "角色预设",
+                "点击玩家头像在躲藏者/抓捕者之间切换"));
+        addBackButton(inventory);
+    }
+
+    private void createRulesMenu(Inventory inventory) {
+        inventory.setItem(10, menuItem(Material.CLOCK,
+                "体型节点 1：" + formatDuration(scaleThresholds[1]), "scale_time_1"));
+        inventory.setItem(11, menuItem(Material.CLOCK,
+                "体型节点 2：" + formatDuration(scaleThresholds[2]), "scale_time_2"));
+        inventory.setItem(12, menuItem(Material.CLOCK,
+                "体型节点 3：" + formatDuration(scaleThresholds[3]), "scale_time_3"));
+        inventory.setItem(19, ComponentItem(Material.SPYGLASS,
+                "体型阶段 " + (selectedScaleStage + 1) + " / 4",
+                "当前倍率：" + formatScale(hiderScales[selectedScaleStage]),
+                "约高：" + displayHiderHeight(selectedScaleStage) + " 格"));
+        inventory.setItem(20, menuItem(Material.RED_CONCRETE, "体型倍率 -0.01", "scale_minus"));
+        inventory.setItem(21, menuItem(Material.GREEN_CONCRETE, "体型倍率 +0.01", "scale_plus"));
+        inventory.setItem(22, menuItem(Material.CLOCK, "切换体型阶段", "scale_stage_next"));
+        inventory.setItem(28, ComponentItem(Material.POTION, "躲藏者缓慢配置",
+                "触发：" + formatDuration(hiderSlowTriggerSeconds),
+                "等级：缓慢 " + (hiderSlowAmplifier + 1)));
+        inventory.setItem(29, menuItem(Material.REPEATER, "缓慢触发时间 +30秒", "slow_time_next"));
+        inventory.setItem(30, menuItem(Material.REDSTONE, "缓慢等级 +1", "slow_amp_next"));
+        addBackButton(inventory);
+    }
+
+    private void createItemMenu(Inventory inventory, boolean hunter) {
+        ItemGrant[] grants = Arrays.stream(ItemGrant.values())
+                .filter(grant -> grant.hunter == hunter).toArray(ItemGrant[]::new);
+        for (int i = 0; i < grants.length; i++) {
+            ItemGrant grant = grants[i];
+            boolean enabled = itemGiveEnabled.getOrDefault(grant.configKey, true);
+            inventory.setItem(10 + i, menuItem(enabled ? Material.LIME_WOOL : Material.GRAY_WOOL,
+                    grant.displayName + "：" + onOff(enabled), "item_toggle_" + grant.configKey));
+        }
+        inventory.setItem(31, ComponentItem(hunter ? Material.NETHERITE_SWORD : Material.BRICK,
+                hunter ? "抓捕者开局道具" : "躲藏者开局道具",
+                "绿色表示游戏开始时自动发放，灰色表示关闭。"));
+        addBackButton(inventory);
+    }
+
+    private void createRadarEventsMenu(Inventory inventory) {
+        inventory.setItem(10, menuItem(Material.COMPASS, "雷达范围：" + radarModeText(), "radar_mode"));
+        inventory.setItem(12, menuItem(randomEventsEnabled ? Material.LIME_WOOL : Material.GRAY_WOOL,
+                "随机事件总开关：" + onOff(randomEventsEnabled), "events_toggle"));
+        int slot = 19;
+        for (RandomEventType type : RandomEventType.values()) {
+            boolean enabled = randomEventEnabled.getOrDefault(type, true);
+            inventory.setItem(slot++, menuItem(enabled ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
+                    "事件：" + type.displayName + " " + onOff(enabled),
+                    "event_toggle_" + type.configKey));
+        }
+        inventory.setItem(28, menuItem(Material.DAYLIGHT_DETECTOR,
+                "事件触发：" + randomEventModeText(), "events_mode"));
+        inventory.setItem(29, menuItem(Material.CLOCK,
+                "事件间隔 +15秒（当前 " + randomEventIntervalSeconds + "）", "events_interval_next"));
+        inventory.setItem(31, ComponentItem(Material.PAPER, "雷达说明",
+                "区块模式按当前区块查询；正方形模式按玩家中心的 X/Z 范围查询。"));
+        addBackButton(inventory);
+    }
+
+    private void addBackButton(Inventory inventory) {
+        inventory.setItem(49, menuItem(Material.ARROW, "返回主菜单", "menu_back"));
     }
 
     private ItemStack playerHead(Player player) {
@@ -667,7 +749,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     }
 
     private String radarModeText() {
-        return radarMode == RadarMode.CHUNK ? "原区块" : "边长10格立方体";
+        return radarMode == RadarMode.CHUNK ? "区块" : "边长 " + radarMode.sideLength + " 格正方形";
     }
 
     private String randomEventModeText() {
@@ -721,6 +803,17 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             grenade.getPersistentDataContainer().set(projectileKey, PersistentDataType.STRING, "grenade");
             grenade.setVelocity(player.getLocation().getDirection().normalize().multiply(1.35));
             gameEntities.add(grenade.getUniqueId());
+        } else if (kind.equals("small_firecracker")) {
+            if (!isHunter(role)) {
+                return;
+            }
+            event.setCancelled(true);
+            consumeOne(player);
+            Snowball firecracker = player.launchProjectile(Snowball.class);
+            firecracker.getPersistentDataContainer().set(projectileKey, PersistentDataType.STRING, "small_firecracker");
+            firecracker.getPersistentDataContainer().set(firecrackerKey, PersistentDataType.BYTE, (byte) 1);
+            firecracker.setVelocity(player.getLocation().getDirection().normalize().multiply(1.05));
+            gameEntities.add(firecracker.getUniqueId());
         } else if (kind.equals("chunk_radar")) {
             if (role != Role.HUNTER) {
                 return;
@@ -779,8 +872,6 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
 
     private void showChunkRadar(Player hunter) {
         Location hunterLocation = hunter.getLocation();
-        int chunkX = hunterLocation.getBlockX() >> 4;
-        int chunkZ = hunterLocation.getBlockZ() >> 4;
         int count = 0;
         for (Map.Entry<UUID, Role> entry : roles.entrySet()) {
             if (entry.getValue() != Role.HIDER) {
@@ -789,13 +880,11 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             Player hider = Bukkit.getPlayer(entry.getKey());
             Location location = lastLocations.get(entry.getKey());
             if (hider != null && location != null && location.getWorld().equals(hunterLocation.getWorld())
-                    && (radarMode == RadarMode.CUBE_10
-                    ? isWithinCube(hunterLocation, location)
-                    : (location.getBlockX() >> 4) == chunkX && (location.getBlockZ() >> 4) == chunkZ)) {
+                    && isWithinRadarRange(hunterLocation, location)) {
                 count++;
             }
         }
-        String modeText = radarMode == RadarMode.CHUNK ? "区块" : "边长10格立方体";
+        String modeText = radarModeText();
         hunter.sendMessage(Component.text("雷达（" + modeText + "）：范围内有 " + count + " 名躲藏者。",
                 NamedTextColor.AQUA));
         hunter.playSound(hunter.getLocation(), Sound.BLOCK_NOTE_BLOCK_CHIME, SoundCategory.PLAYERS, 1.0f, 1.4f);
@@ -839,18 +928,29 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                 .filter(player -> roles.get(player.getUniqueId()) == Role.HIDER)
                 .filter(player -> lastLocations.get(player.getUniqueId()) != null)
                 .filter(player -> lastLocations.get(player.getUniqueId()).getWorld().equals(source.getWorld()))
-                .filter(player -> radarMode != RadarMode.CUBE_10
-                        || isWithinCube(sourceLocation, lastLocations.get(player.getUniqueId())))
+                .filter(player -> isWithinRadarRange(sourceLocation, lastLocations.get(player.getUniqueId())))
                 .min(Comparator.comparingDouble(player -> lastLocations.get(player.getUniqueId())
                         .distanceSquared(sourceLocation)))
                 .orElse(null);
     }
 
-    private boolean isWithinCube(Location center, Location target) {
-        return target != null
-                && Math.abs(target.getX() - center.getX()) <= 5.0
-                && Math.abs(target.getY() - center.getY()) <= 5.0
-                && Math.abs(target.getZ() - center.getZ()) <= 5.0;
+    private boolean isWithinRadarRange(Location center, Location target) {
+        if (target == null || center.getWorld() != target.getWorld()) {
+            return false;
+        }
+        if (radarMode == RadarMode.CHUNK) {
+            return (target.getBlockX() >> 4) == (center.getBlockX() >> 4)
+                    && (target.getBlockZ() >> 4) == (center.getBlockZ() >> 4);
+        }
+        int side = radarMode.sideLength;
+        int lowerOffset = (side - 1) / 2;
+        int upperOffset = side - 1 - lowerOffset;
+        int centerX = center.getBlockX();
+        int centerZ = center.getBlockZ();
+        return target.getBlockX() >= centerX - lowerOffset
+                && target.getBlockX() <= centerX + upperOffset
+                && target.getBlockZ() >= centerZ - lowerOffset
+                && target.getBlockZ() <= centerZ + upperOffset;
     }
 
     private void enforceTrackingBulletSpeed() {
@@ -958,6 +1058,8 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                     reveal(player, REVEAL_MILLIS);
                 }
             }
+        } else if (kind.equals("small_firecracker")) {
+            processFirecrackerImpact(projectile.getLocation());
         } else if (kind.equals("tracking")) {
             Entity hit = event.getHitEntity();
             if (hit instanceof Player player && roles.get(player.getUniqueId()) == Role.HIDER) {
@@ -965,6 +1067,63 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             }
         }
         projectile.remove();
+    }
+
+    private void processFirecrackerImpact(Location impact) {
+        for (Player target : new ArrayList<>(Bukkit.getOnlinePlayers())) {
+            Location targetLocation = lastLocations.get(target.getUniqueId());
+            if (roles.get(target.getUniqueId()) != Role.HIDER || targetLocation == null
+                    || !targetLocation.getWorld().equals(impact.getWorld())
+                    || targetLocation.distanceSquared(impact) > 4.0) {
+                continue;
+            }
+            UUID targetId = target.getUniqueId();
+            int hit = firecrackerHits.merge(targetId, 1, Integer::sum);
+            target.getScheduler().run(plugin, task -> applyFirecrackerHit(target, hit), () -> { });
+        }
+    }
+
+    private void applyFirecrackerHit(Player target, int hit) {
+        if (phase != GamePhase.RUNNING || roles.get(target.getUniqueId()) != Role.HIDER) {
+            return;
+        }
+        PlayerRoundState state = playerStates.get(target.getUniqueId());
+        if (state == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        state.firecrackerSlowUntil = now + FIRECRACKER_EFFECT_MILLIS;
+        if (hit == 1) {
+            target.sendMessage(Component.text("小摔炮命中：缓慢 V 持续 5 秒。", NamedTextColor.YELLOW));
+        } else if (hit == 2) {
+            startFirecrackerParticles(target);
+            target.sendMessage(Component.text("小摔炮再次命中：水滴效果持续 5 秒。", NamedTextColor.AQUA));
+        } else {
+            firecrackerHits.remove(target.getUniqueId());
+            target.setHealth(Math.max(0.0, target.getHealth() - 10.0));
+            target.playSound(target.getLocation(), Sound.ENTITY_SILVERFISH_HURT,
+                    SoundCategory.PLAYERS, 1.0f, 1.0f);
+            target.sendMessage(Component.text("小摔炮第三次命中：受到 5 颗心伤害。", NamedTextColor.RED));
+        }
+    }
+
+    private void startFirecrackerParticles(Player target) {
+        UUID id = target.getUniqueId();
+        ScheduledTask previous = firecrackerParticleTasks.remove(id);
+        if (previous != null) {
+            previous.cancel();
+        }
+        long until = System.currentTimeMillis() + FIRECRACKER_EFFECT_MILLIS;
+        ScheduledTask task = target.getScheduler().runAtFixedRate(plugin, scheduled -> {
+            if (phase != GamePhase.RUNNING || !target.isOnline() || System.currentTimeMillis() >= until) {
+                scheduled.cancel();
+                firecrackerParticleTasks.remove(id, scheduled);
+                return;
+            }
+            Location location = target.getLocation().add(0, 0.8, 0);
+            target.getWorld().spawnParticle(Particle.SPLASH, location, 35, 0.45, 0.7, 0.45, 0.08);
+        }, () -> firecrackerParticleTasks.remove(id), 1L, 5L);
+        firecrackerParticleTasks.put(id, task);
     }
 
     private void reveal(Player player, long duration) {
@@ -1021,6 +1180,11 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                 killer.sendMessage(Component.text("成功击杀躲藏者，追踪雷达冷却已重置。", NamedTextColor.GREEN));
             }
             pendingConversion.add(id);
+            ScheduledTask particles = firecrackerParticleTasks.remove(id);
+            if (particles != null) {
+                particles.cancel();
+            }
+            firecrackerHits.remove(id);
             event.getEntity().sendMessage(Component.text("你已被抓捕，重生后将成为普通抓捕者。", NamedTextColor.RED));
         }
     }
@@ -1066,6 +1230,11 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         if (reveal != null) {
             reveal.cancel();
         }
+        ScheduledTask particles = firecrackerParticleTasks.remove(id);
+        if (particles != null) {
+            particles.cancel();
+        }
+        firecrackerHits.remove(id);
         lastLocations.remove(id);
     }
 
@@ -1089,7 +1258,43 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         if (value == null) {
             return;
         }
-        if (value.equals("start")) {
+        if (value.equals("close_menu")) {
+            admin.closeInventory();
+            return;
+        } else if (value.equals("menu_back")) {
+            admin.openInventory(createAdminInventory(AdminMenuPage.MAIN));
+            return;
+        } else if (value.equals("menu_game")) {
+            admin.openInventory(createAdminInventory(AdminMenuPage.GAME));
+            return;
+        } else if (value.equals("menu_players")) {
+            admin.openInventory(createAdminInventory(AdminMenuPage.PLAYERS));
+            return;
+        } else if (value.equals("menu_rules")) {
+            admin.openInventory(createAdminInventory(AdminMenuPage.RULES));
+            return;
+        } else if (value.equals("menu_hider_items")) {
+            admin.openInventory(createAdminInventory(AdminMenuPage.HIDER_ITEMS));
+            return;
+        } else if (value.equals("menu_hunter_items")) {
+            admin.openInventory(createAdminInventory(AdminMenuPage.HUNTER_ITEMS));
+            return;
+        } else if (value.equals("menu_radar_events")) {
+            admin.openInventory(createAdminInventory(AdminMenuPage.RADAR_EVENTS));
+            return;
+        } else if (value.startsWith("item_toggle_")) {
+            String key = value.substring("item_toggle_".length());
+            for (ItemGrant grant : ItemGrant.values()) {
+                if (grant.configKey.equals(key)) {
+                    boolean enabled = !itemGiveEnabled.getOrDefault(key, true);
+                    itemGiveEnabled.put(key, enabled);
+                    saveGameConfig();
+                    admin.sendMessage(Component.text(grant.displayName + "开局发放已" + (enabled ? "开启" : "关闭") + "。",
+                            NamedTextColor.GREEN));
+                    break;
+                }
+            }
+        } else if (value.equals("start")) {
             startGame(admin);
         } else if (value.equals("stop")) {
             stopGame(admin, true);
@@ -1151,7 +1356,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             hiderSlowAmplifier = (hiderSlowAmplifier + 1) % (MAX_SLOW_AMPLIFIER + 1);
             saveGameConfig();
         } else if (value.equals("radar_mode")) {
-            radarMode = radarMode == RadarMode.CHUNK ? RadarMode.CUBE_10 : RadarMode.CHUNK;
+            radarMode = radarMode.next();
             saveGameConfig();
             admin.sendMessage(Component.text("雷达模式已切换为：" + radarModeText() + "。", NamedTextColor.GREEN));
         } else if (value.equals("events_toggle")) {
@@ -1187,7 +1392,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                 return;
             }
         }
-        admin.openInventory(createAdminInventory());
+        admin.openInventory(createAdminInventory(holder.page));
     }
 
     @EventHandler
@@ -1237,6 +1442,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         lastLocations.clear();
         swordHits.clear();
         bowHits.clear();
+        firecrackerHits.clear();
         lastHiderAttackers.clear();
         radarCooldowns.clear();
         whistleCooldowns.clear();
@@ -1270,6 +1476,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         playerStates.clear();
         whistleCooldowns.clear();
         whistleCycles.clear();
+        firecrackerHits.clear();
         roles.put(player.getUniqueId(), role);
         player.getScheduler().run(plugin, task -> {
             playerStates.put(player.getUniqueId(), PlayerRoundState.capture(player));
@@ -1360,32 +1567,59 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
 
     private void giveHiderKit(Player player) {
         PlayerInventory inventory = player.getInventory();
-        inventory.addItem(customItem(Material.MUSIC_DISC_CAT, "阿巴土坎片", "abatukan", 1,
-                "使用后加速 3 秒，随后疲劳 10 秒。"));
-        inventory.addItem(nailBrick());
+        if (grantEnabled(ItemGrant.HIDER_ABATUKAN)) {
+            inventory.addItem(customItem(Material.MUSIC_DISC_CAT, "阿巴土坎片", "abatukan", 1,
+                    "使用后加速 3 秒，随后疲劳 10 秒。"));
+        }
+        if (grantEnabled(ItemGrant.HIDER_NAIL_BRICK)) {
+            inventory.addItem(nailBrick());
+        }
+        ItemGrant[] whistles = {ItemGrant.HIDER_WHISTLE_1, ItemGrant.HIDER_WHISTLE_2, ItemGrant.HIDER_WHISTLE_3};
         for (int level = 1; level <= 3; level++) {
-            inventory.addItem(whistle(level));
+            if (grantEnabled(whistles[level - 1])) {
+                inventory.addItem(whistle(level));
+            }
         }
     }
 
     private void giveHunterKit(Player player, boolean eliminated) {
         PlayerInventory inventory = player.getInventory();
-        inventory.addItem(customItem(Material.NETHERITE_SWORD, "下界合金剑", "hunter_sword", 1,
-                "两次命中可击杀躲藏者。"));
-        inventory.addItem(customItem(Material.BOW, "猎人弓", "hunter_bow", 1,
-                "两箭可击杀躲藏者。"));
-        inventory.addItem(customItem(Material.ARROW, "猎人箭", "hunter_arrow_item", 16,
-                "猎人弓专用箭。"));
-        inventory.addItem(customItem(Material.ENDER_PEARL, "追击末影珍珠", "hunter_pearl", 32,
-                "高速追击与位移。"));
-        inventory.addItem(customItem(Material.SNOWBALL, "手雷", "grenade", 3,
-                "命中后让躲藏者暴露 5 秒。"));
-        if (!eliminated) {
-            inventory.addItem(customItem(Material.COMPASS, "区块雷达", "chunk_radar", 1,
-                    "显示当前区块中的躲藏者数量。"));
+        if (grantEnabled(ItemGrant.HUNTER_SWORD)) {
+            inventory.addItem(customItem(Material.NETHERITE_SWORD, "下界合金剑", "hunter_sword", 1,
+                    "两次命中可击杀躲藏者。"));
+        }
+        if (grantEnabled(ItemGrant.HUNTER_BOW)) {
+            inventory.addItem(customItem(Material.BOW, "猎人弓", "hunter_bow", 1,
+                    "两箭可击杀躲藏者。"));
+        }
+        if (grantEnabled(ItemGrant.HUNTER_ARROW)) {
+            inventory.addItem(customItem(Material.ARROW, "猎人箭", "hunter_arrow_item", 16,
+                    "猎人弓专用箭。"));
+        }
+        if (grantEnabled(ItemGrant.HUNTER_PEARL)) {
+            inventory.addItem(customItem(Material.ENDER_PEARL, "追击末影珍珠", "hunter_pearl", 32,
+                    "高速追击与位移。"));
+        }
+        if (grantEnabled(ItemGrant.HUNTER_GRENADE)) {
+            inventory.addItem(customItem(Material.SNOWBALL, "手雷", "grenade", 3,
+                    "命中后让躲藏者暴露 5 秒。"));
+        }
+        if (grantEnabled(ItemGrant.HUNTER_FIRECRACKER)) {
+            inventory.addItem(customItem(Material.FIREWORK_STAR, "小摔炮", "small_firecracker", 3,
+                    "同一躲藏者三次命中会造成递增效果。"));
+        }
+        if (!eliminated && grantEnabled(ItemGrant.HUNTER_RADAR)) {
+            inventory.addItem(customItem(Material.COMPASS, "范围雷达", "chunk_radar", 1,
+                    "显示当前雷达范围中的躲藏者数量。"));
+        }
+        if (!eliminated && grantEnabled(ItemGrant.HUNTER_TRACKING_RADAR)) {
             inventory.addItem(customItem(Material.ENDER_EYE, "追踪雷达", "tracking_radar", 1,
                     "发射追踪潜影贝子弹。"));
         }
+    }
+
+    private boolean grantEnabled(ItemGrant grant) {
+        return itemGiveEnabled.getOrDefault(grant.configKey, true);
     }
 
     private ItemStack whistle(int level) {
@@ -1502,6 +1736,10 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             task.cancel();
         }
         revealTasks.clear();
+        for (ScheduledTask task : firecrackerParticleTasks.values()) {
+            task.cancel();
+        }
+        firecrackerParticleTasks.clear();
         for (UUID id : new ArrayList<>(playerStates.keySet())) {
             Player player = Bukkit.getPlayer(id);
             PlayerRoundState state = playerStates.get(id);
@@ -1523,6 +1761,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         lastLocations.clear();
         swordHits.clear();
         bowHits.clear();
+        firecrackerHits.clear();
         lastHiderAttackers.clear();
         radarCooldowns.clear();
         whistleCooldowns.clear();
@@ -1707,8 +1946,70 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     }
 
     private enum RadarMode {
-        CHUNK,
-        CUBE_10
+        CHUNK(0),
+        SQUARE_1(1),
+        SQUARE_2(2),
+        SQUARE_3(3),
+        SQUARE_4(4),
+        SQUARE_5(5),
+        SQUARE_6(6),
+        SQUARE_7(7),
+        SQUARE_8(8),
+        SQUARE_9(9),
+        SQUARE_10(10);
+
+        private final int sideLength;
+
+        RadarMode(int sideLength) {
+            this.sideLength = sideLength;
+        }
+
+        private RadarMode next() {
+            RadarMode[] values = values();
+            return values[(ordinal() + 1) % values.length];
+        }
+    }
+
+    private enum AdminMenuPage {
+        MAIN("躲猫猫控制台"),
+        GAME("控制台 / 游戏控制"),
+        PLAYERS("控制台 / 玩家与角色"),
+        RULES("控制台 / 规则与体型"),
+        HIDER_ITEMS("控制台 / 躲藏者道具"),
+        HUNTER_ITEMS("控制台 / 抓捕者道具"),
+        RADAR_EVENTS("控制台 / 雷达与随机事件");
+
+        private final String title;
+
+        AdminMenuPage(String title) {
+            this.title = title;
+        }
+    }
+
+    private enum ItemGrant {
+        HIDER_ABATUKAN(false, "hider.abatukan", "阿巴土坎片"),
+        HIDER_NAIL_BRICK(false, "hider.nail-brick", "固定棒"),
+        HIDER_WHISTLE_1(false, "hider.whistle-1", "嘲讽哨 1"),
+        HIDER_WHISTLE_2(false, "hider.whistle-2", "嘲讽哨 2"),
+        HIDER_WHISTLE_3(false, "hider.whistle-3", "嘲讽哨 3"),
+        HUNTER_SWORD(true, "hunter.sword", "下界合金剑"),
+        HUNTER_BOW(true, "hunter.bow", "猎人弓"),
+        HUNTER_ARROW(true, "hunter.arrow", "猎人箭"),
+        HUNTER_PEARL(true, "hunter.pearl", "末影珍珠"),
+        HUNTER_GRENADE(true, "hunter.grenade", "手雷"),
+        HUNTER_FIRECRACKER(true, "hunter.small-firecracker", "小摔炮"),
+        HUNTER_RADAR(true, "hunter.radar", "范围雷达"),
+        HUNTER_TRACKING_RADAR(true, "hunter.tracking-radar", "追踪雷达");
+
+        private final boolean hunter;
+        private final String configKey;
+        private final String displayName;
+
+        ItemGrant(boolean hunter, String configKey, String displayName) {
+            this.hunter = hunter;
+            this.configKey = configKey;
+            this.displayName = displayName;
+        }
     }
 
     private enum RandomEventMode {
@@ -1732,7 +2033,12 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     }
 
     private static final class AdminMenuHolder implements InventoryHolder {
+        private final AdminMenuPage page;
         private Inventory inventory;
+
+        private AdminMenuHolder(AdminMenuPage page) {
+            this.page = page;
+        }
 
         @Override
         public Inventory getInventory() {
@@ -1750,6 +2056,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         private long revealUntil;
         private long eventSlowUntil;
         private int eventSlowAmplifier;
+        private long firecrackerSlowUntil;
         private long eventSpeedUntil;
         private int eventSpeedAmplifier;
 

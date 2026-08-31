@@ -13,6 +13,22 @@ hns:
     amplifier: 5
   radar:
     mode: CHUNK
+  items:
+    hider:
+      abatukan: true
+      nail-brick: true
+      whistle-1: true
+      whistle-2: true
+      whistle-3: true
+    hunter:
+      sword: true
+      bow: true
+      arrow: true
+      pearl: true
+      grenade: true
+      small-firecracker: true
+      radar: true
+      tracking-radar: true
   random-events:
     enabled: false
     mode: RANDOM
