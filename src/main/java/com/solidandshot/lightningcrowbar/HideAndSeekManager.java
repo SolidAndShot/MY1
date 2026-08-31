@@ -123,6 +123,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     private final Map<UUID, Integer> swordHits = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> bowHits = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> firecrackerHits = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> firecrackerThrows = new ConcurrentHashMap<>();
     private final Map<UUID, UUID> lastHiderAttackers = new ConcurrentHashMap<>();
     private final Set<UUID> pendingConversion = ConcurrentHashMap.newKeySet();
     private final Map<UUID, ScheduledTask> revealTasks = new ConcurrentHashMap<>();
@@ -1015,6 +1016,9 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             return;
         }
         gameEntities.add(projectileId);
+        if (kind.equals("small_firecracker")) {
+            firecrackerThrows.merge(throwerId, 1, Integer::sum);
+        }
         projectile.setVelocity(direction.multiply(speed));
         projectile.getScheduler().runDelayed(plugin, task -> {
             activeProjectiles.remove(throwerId, projectileId);
@@ -1473,7 +1477,8 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             spawnRangeRing(projectile.getLocation(), 2.0);
             Player thrower = projectile.getShooter() instanceof Player player ? player : null;
             boolean hitHider = processFirecrackerImpact(projectile.getLocation(), thrower);
-            if (hitHider && thrower != null) {
+            int throwCount = thrower == null ? 1 : firecrackerThrows.getOrDefault(thrower.getUniqueId(), 1);
+            if (hitHider && thrower != null && throwCount >= 2) {
                 firecrackerCooldowns.remove(thrower.getUniqueId());
                 restoreCooldownKind(thrower, "small_firecracker");
             } else if (thrower != null) {
@@ -1695,6 +1700,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         }
         clearWhistleEffect(id, event.getPlayer());
         firecrackerHits.remove(id);
+        firecrackerThrows.remove(id);
         firecrackerCooldowns.remove(id);
         grenadeCooldowns.remove(id);
         rangeRadarCooldowns.remove(id);
@@ -1974,6 +1980,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         swordHits.clear();
         bowHits.clear();
         firecrackerHits.clear();
+        firecrackerThrows.clear();
         lastHiderAttackers.clear();
         radarCooldowns.clear();
         rangeRadarCooldowns.clear();
@@ -2022,6 +2029,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         clearAllWhistleEffects();
         cancelTrackingBullets();
         firecrackerHits.clear();
+        firecrackerThrows.clear();
         roles.put(player.getUniqueId(), role);
         player.getScheduler().run(plugin, task -> {
             playerStates.put(player.getUniqueId(), PlayerRoundState.capture(player));
@@ -2392,6 +2400,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         swordHits.clear();
         bowHits.clear();
         firecrackerHits.clear();
+        firecrackerThrows.clear();
         lastHiderAttackers.clear();
         radarCooldowns.clear();
         rangeRadarCooldowns.clear();

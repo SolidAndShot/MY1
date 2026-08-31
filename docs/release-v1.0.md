@@ -10,8 +10,8 @@ v1.0 是本项目的首个正式发行版，面向 Minecraft 26.2 的 Luminol/Fo
 
 ## 安装
 
-1. 下载发行资源 `LightningCrowbar-1.0.jar`。
-2. 将 JAR 放入服务端 `plugins` 目录。
+1. 下载发行资源 `LightningCrowbar-1.0.jar`，或下载 `LightningCrowbar-1.0-server.zip`。
+2. 将 JAR 放入服务端 `plugins` 目录；服务器导入 ZIP 已包含 `plugins/LightningCrowbar-1.0.jar`，解压后即可使用。
 3. 完整重启服务端。
 4. 管理员执行 `/hns admin` 打开游戏管理控制台。
 
