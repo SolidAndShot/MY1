@@ -3,7 +3,10 @@ package com.solidandshot.lightningcrowbar;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.title.Title;
 import org.bukkit.Bukkit;
+import org.bukkit.Color;
+import org.bukkit.FireworkEffect;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -15,12 +18,13 @@ import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.entity.AbstractArrow;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.Firework;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
 import org.bukkit.entity.ShulkerBullet;
 import org.bukkit.entity.Snowball;
-import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Pose;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -30,6 +34,7 @@ import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.ClickType;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -40,6 +45,7 @@ import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.FireworkMeta;
 import org.bukkit.inventory.meta.SkullMeta;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
@@ -53,14 +59,13 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.EnumMap;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -73,24 +78,37 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     private static final long ROUND_SECONDS = 10 * 60L;
     private static final long HIDER_FAST_SECONDS = 30L;
     private static final int[] SCALE_THRESHOLDS = {0, 180, 300, 480};
-    private static final double[] HIDER_SCALES = {1.0, 1.5, 2.0, 3.0};
+    // A normal player is about 1.8 blocks tall. Keep every result below the
+    // requested visual height while using the server's scale attribute.
+    private static final double[] HIDER_SCALES = {0.54, 0.82, 1.10, 1.65};
     private static final int MAX_HITS = 2;
     private static final long BOOST_MILLIS = 3_000L;
     private static final long FATIGUE_MILLIS = 10_000L;
     private static final long RADAR_COOLDOWN_MILLIS = 30_000L;
+    private static final double TRACKING_BULLET_SPEED = 0.16;
+    private static final long WHISTLE_COOLDOWN_MILLIS = 20_000L;
     private static final long REVEAL_MILLIS = 5_000L;
+    private static final int MIN_EVENT_INTERVAL_SECONDS = 15;
+    private static final int MAX_SLOW_AMPLIFIER = 10;
+    private static final double[] MAX_HIDER_SCALES = {0.55, 0.83, 1.11, 1.66};
 
     private final LightningCrowbarPlugin plugin;
     private final Map<UUID, Role> roles = new ConcurrentHashMap<>();
     private final Map<UUID, Role> configuredRoles = new ConcurrentHashMap<>();
     private final Map<UUID, PlayerRoundState> playerStates = new ConcurrentHashMap<>();
     private final Map<UUID, Long> radarCooldowns = new ConcurrentHashMap<>();
+    private final Map<UUID, Map<Integer, Long>> whistleCooldowns = new ConcurrentHashMap<>();
+    private final Map<UUID, Set<Integer>> whistleCycles = new ConcurrentHashMap<>();
     private final Map<UUID, Location> lastLocations = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> swordHits = new ConcurrentHashMap<>();
     private final Map<UUID, Integer> bowHits = new ConcurrentHashMap<>();
+    private final Map<UUID, UUID> lastHiderAttackers = new ConcurrentHashMap<>();
     private final Set<UUID> pendingConversion = ConcurrentHashMap.newKeySet();
     private final Map<UUID, ScheduledTask> revealTasks = new ConcurrentHashMap<>();
     private final Set<UUID> gameEntities = ConcurrentHashMap.newKeySet();
+    private final double[] hiderScales = HIDER_SCALES.clone();
+    private final int[] scaleThresholds = SCALE_THRESHOLDS.clone();
+    private final Map<RandomEventType, Boolean> randomEventEnabled = new ConcurrentHashMap<>();
 
     private NamespacedKey itemKey;
     private NamespacedKey levelKey;
@@ -102,6 +120,16 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
     private volatile long startedAtMillis;
     private volatile String lastResult = "尚未开始";
     private volatile boolean testMode;
+    private volatile int announcedScaleStage;
+    private volatile int selectedScaleStage;
+    private volatile int hiderSlowTriggerSeconds = (int) HIDER_FAST_SECONDS;
+    private volatile int hiderSlowAmplifier = 5;
+    private volatile boolean randomEventsEnabled;
+    private volatile RandomEventMode randomEventMode = RandomEventMode.RANDOM;
+    private volatile int randomEventIntervalSeconds = 120;
+    private volatile long nextRandomEventAtMillis;
+    private volatile long nextTimedEventSecond;
+    private volatile RadarMode radarMode = RadarMode.CHUNK;
 
     public HideAndSeekManager(LightningCrowbarPlugin plugin) {
         this.plugin = plugin;
@@ -110,6 +138,10 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         projectileKey = new NamespacedKey(plugin, "hns_projectile");
         targetKey = new NamespacedKey(plugin, "hns_target");
         nailBrickKey = new NamespacedKey(plugin, "nail_brick");
+        for (RandomEventType type : RandomEventType.values()) {
+            randomEventEnabled.put(type, true);
+        }
+        loadGameConfig();
         gameTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, task -> tickGame(), 1L, 20L);
     }
 
@@ -123,6 +155,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         }
         revealTasks.clear();
         stopGame(null, false);
+        saveGameConfig();
     }
 
     private void tickGame() {
@@ -135,6 +168,15 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             finishGame("躲藏者坚持到时间，躲藏者胜利！");
             return;
         }
+
+        int currentScaleStage = scaleStage(elapsed);
+        if (currentScaleStage > announcedScaleStage) {
+            announcedScaleStage = currentScaleStage;
+            broadcastScaleChange(currentScaleStage);
+        }
+
+        processRandomEvents(elapsed);
+        enforceTrackingBulletSpeed();
 
         for (UUID id : new ArrayList<>(roles.keySet())) {
             Player player = Bukkit.getPlayer(id);
@@ -166,26 +208,42 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             if (stage != state.scaleStage) {
                 state.scaleStage = stage;
                 applyHiderScaleAndPose(player, state, stage);
-                player.sendMessage(Component.text("你的体型已变化为 " + HIDER_SCALES[stage] + " 格。",
+                player.sendMessage(Component.text("你的体型已变化为约 " + displayHiderHeight(stage) + " 格。",
                         NamedTextColor.YELLOW));
             }
             applyHiderEffects(player, state, elapsed);
         } else {
-            applyHunterEffects(player, role == Role.ELIMINATED_HUNTER, elapsed);
+            applyHunterEffects(player, state, role == Role.ELIMINATED_HUNTER, elapsed);
         }
 
         if (state.revealUntil > System.currentTimeMillis()) {
             player.setGlowing(true);
         }
         String roleText = role == Role.HIDER ? "躲藏者" : role == Role.HUNTER ? "抓捕者" : "普通抓捕者";
-        player.sendActionBar(Component.text("[" + roleText + "] 剩余 " + formatRemaining()
-                + " | 躲藏者 " + hiderCount(), NamedTextColor.AQUA));
+        player.sendActionBar(Component.text("[" + roleText + "] 剩余 " + formatRemaining(elapsed)
+                + " | " + formatNextEvent(elapsed) + " | 躲藏者 " + hiderCount(), NamedTextColor.AQUA));
+    }
+
+    private void broadcastScaleChange(int stage) {
+        String text = "躲藏者体型已变为约 " + displayHiderHeight(stage) + " 格";
+        Title title = Title.title(
+                Component.text("体型变化", NamedTextColor.GOLD),
+                Component.text(text, NamedTextColor.YELLOW),
+                Title.Times.times(Duration.ofMillis(1_000), Duration.ofMillis(2_600), Duration.ofMillis(1_400)));
+        for (Player viewer : Bukkit.getOnlinePlayers()) {
+            viewer.getScheduler().run(plugin, task -> {
+                viewer.showTitle(title);
+                viewer.playSound(viewer.getLocation(), "minecraft:apply_effect.trial_omen",
+                        SoundCategory.PLAYERS, 0.45f, 0.2f);
+            }, () -> { });
+        }
+        broadcast(Component.text(text + "。", NamedTextColor.YELLOW));
     }
 
     private void applyHiderScaleAndPose(Player player, PlayerRoundState state, int stage) {
         AttributeInstance scale = player.getAttribute(Attribute.SCALE);
         if (scale != null) {
-            scale.setBaseValue(HIDER_SCALES[stage]);
+            scale.setBaseValue(hiderScales[stage]);
         }
         Pose pose = switch (stage) {
             case 1 -> Pose.SITTING;
@@ -203,25 +261,38 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             addEffect(player, PotionEffectType.SPEED, 8);
         } else if (state.fatigueUntil > now) {
             addEffect(player, PotionEffectType.SLOWNESS, 5);
-        } else if (elapsed < HIDER_FAST_SECONDS) {
+        } else if (elapsed < hiderSlowTriggerSeconds) {
             addEffect(player, PotionEffectType.SPEED, 4);
         } else {
-            addEffect(player, PotionEffectType.SLOWNESS, 5);
+            addEffect(player, PotionEffectType.SLOWNESS, hiderSlowAmplifier);
+        }
+        if (state.eventSlowUntil > now) {
+            addEffect(player, PotionEffectType.SLOWNESS,
+                    Math.max(hiderSlowAmplifier, state.eventSlowAmplifier));
+        }
+        if (state.eventSpeedUntil > now) {
+            addEffect(player, PotionEffectType.SPEED, Math.max(4, state.eventSpeedAmplifier));
         }
         player.removePotionEffect(PotionEffectType.STRENGTH);
         player.removePotionEffect(PotionEffectType.JUMP_BOOST);
         player.removePotionEffect(PotionEffectType.GLOWING);
     }
 
-    private void applyHunterEffects(Player player, boolean eliminated, long elapsed) {
+    private void applyHunterEffects(Player player, PlayerRoundState state, boolean eliminated, long elapsed) {
         player.removePotionEffect(PotionEffectType.SPEED);
         player.removePotionEffect(PotionEffectType.JUMP_BOOST);
         player.removePotionEffect(PotionEffectType.STRENGTH);
         player.removePotionEffect(PotionEffectType.GLOWING);
-        addEffect(player, PotionEffectType.SPEED, eliminated ? 0 : 1);
+        int speed = eliminated ? 0 : 1;
+        if (state.eventSpeedUntil > System.currentTimeMillis()) {
+            speed = Math.max(speed, state.eventSpeedAmplifier);
+        }
+        addEffect(player, PotionEffectType.SPEED, speed);
         addEffect(player, PotionEffectType.JUMP_BOOST, eliminated ? 0 : 1);
-        int strength = eliminated ? 0 : Math.min(4, (int) (elapsed / 120L));
-        addEffect(player, PotionEffectType.STRENGTH, strength);
+        if (!eliminated) {
+            int strength = Math.min(4, (int) (elapsed / 120L));
+            addEffect(player, PotionEffectType.STRENGTH, strength);
+        }
         addEffect(player, PotionEffectType.GLOWING, 0);
     }
 
@@ -235,12 +306,226 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
 
     private int scaleStage(long elapsed) {
         int stage = 0;
-        for (int i = 1; i < SCALE_THRESHOLDS.length; i++) {
-            if (elapsed >= SCALE_THRESHOLDS[i]) {
+        for (int i = 1; i < scaleThresholds.length; i++) {
+            if (elapsed >= scaleThresholds[i]) {
                 stage = i;
             }
         }
         return stage;
+    }
+
+    private String formatNextEvent(long elapsed) {
+        long next = ROUND_SECONDS;
+        for (int threshold : scaleThresholds) {
+            if (threshold > elapsed) {
+                next = threshold;
+                break;
+            }
+        }
+        String label = next == ROUND_SECONDS ? "结算" : "下次体型";
+        return label + " " + formatDuration(Math.max(0L, next - elapsed));
+    }
+
+    private double displayHiderHeight(int stage) {
+        return Math.round(hiderScales[stage] * 1.8 * 100.0) / 100.0;
+    }
+
+    private String formatDuration(long seconds) {
+        return String.format(Locale.ROOT, "%02d:%02d", seconds / 60, seconds % 60);
+    }
+
+    private void loadGameConfig() {
+        ConfigurationSection root = plugin.getConfig().getConfigurationSection("hns");
+        if (root == null) {
+            return;
+        }
+        for (int i = 0; i < hiderScales.length; i++) {
+            hiderScales[i] = clampScale(i, root.getDouble("scales." + i, hiderScales[i]));
+        }
+        for (int i = 1; i < scaleThresholds.length; i++) {
+            int fallback = scaleThresholds[i];
+            scaleThresholds[i] = Math.max(scaleThresholds[i - 1] + 1,
+                    Math.min((int) ROUND_SECONDS - 1,
+                            root.getInt("scale-thresholds." + i, fallback)));
+        }
+        hiderSlowTriggerSeconds = Math.max(1,
+                Math.min((int) ROUND_SECONDS - 1,
+                        root.getInt("hider-slow.trigger-seconds", hiderSlowTriggerSeconds)));
+        hiderSlowAmplifier = Math.max(0,
+                Math.min(MAX_SLOW_AMPLIFIER,
+                        root.getInt("hider-slow.amplifier", hiderSlowAmplifier)));
+        randomEventsEnabled = root.getBoolean("random-events.enabled", randomEventsEnabled);
+        randomEventMode = parseRandomEventMode(root.getString("random-events.mode"), randomEventMode);
+        randomEventIntervalSeconds = Math.max(MIN_EVENT_INTERVAL_SECONDS,
+                Math.min((int) ROUND_SECONDS, root.getInt("random-events.interval-seconds", randomEventIntervalSeconds)));
+        radarMode = parseRadarMode(root.getString("radar.mode"), radarMode);
+        ConfigurationSection events = root.getConfigurationSection("random-events.events");
+        if (events != null) {
+            for (RandomEventType type : RandomEventType.values()) {
+                randomEventEnabled.put(type, events.getBoolean(type.configKey, true));
+            }
+        }
+    }
+
+    private void saveGameConfig() {
+        plugin.getConfig().set("hns.scales.0", hiderScales[0]);
+        plugin.getConfig().set("hns.scales.1", hiderScales[1]);
+        plugin.getConfig().set("hns.scales.2", hiderScales[2]);
+        plugin.getConfig().set("hns.scales.3", hiderScales[3]);
+        plugin.getConfig().set("hns.scale-thresholds.1", scaleThresholds[1]);
+        plugin.getConfig().set("hns.scale-thresholds.2", scaleThresholds[2]);
+        plugin.getConfig().set("hns.scale-thresholds.3", scaleThresholds[3]);
+        plugin.getConfig().set("hns.hider-slow.trigger-seconds", hiderSlowTriggerSeconds);
+        plugin.getConfig().set("hns.hider-slow.amplifier", hiderSlowAmplifier);
+        plugin.getConfig().set("hns.random-events.enabled", randomEventsEnabled);
+        plugin.getConfig().set("hns.random-events.mode", randomEventMode.name());
+        plugin.getConfig().set("hns.random-events.interval-seconds", randomEventIntervalSeconds);
+        for (RandomEventType type : RandomEventType.values()) {
+            plugin.getConfig().set("hns.random-events.events." + type.configKey,
+                    randomEventEnabled.getOrDefault(type, true));
+        }
+        plugin.getConfig().set("hns.radar.mode", radarMode.name());
+        plugin.saveConfig();
+    }
+
+    private double clampScale(int stage, double value) {
+        return Math.max(0.10, Math.min(MAX_HIDER_SCALES[stage], value));
+    }
+
+    private void adjustScaleThreshold(int stage, int deltaSeconds) {
+        if (stage < 1 || stage >= scaleThresholds.length) {
+            return;
+        }
+        int minimum = stage == 1 ? 1 : scaleThresholds[stage - 1] + 1;
+        int maximum = stage == scaleThresholds.length - 1
+                ? (int) ROUND_SECONDS - 1
+                : scaleThresholds[stage + 1] - 1;
+        if (maximum < minimum) {
+            return;
+        }
+        int candidate = scaleThresholds[stage] + deltaSeconds;
+        scaleThresholds[stage] = Math.max(minimum, Math.min(maximum, candidate));
+    }
+
+    private void markHiderScalesDirty() {
+        for (PlayerRoundState state : playerStates.values()) {
+            state.scaleStage = -1;
+        }
+    }
+
+    private void processRandomEvents(long elapsed) {
+        if (!randomEventsEnabled || phase != GamePhase.RUNNING) {
+            return;
+        }
+        List<RandomEventType> enabled = Arrays.stream(RandomEventType.values())
+                .filter(type -> randomEventEnabled.getOrDefault(type, true))
+                .toList();
+        if (enabled.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (randomEventMode == RandomEventMode.TIMED) {
+            if (elapsed >= nextTimedEventSecond) {
+                triggerRandomEvent(enabled);
+                do {
+                    nextTimedEventSecond += randomEventIntervalSeconds;
+                } while (nextTimedEventSecond <= elapsed);
+            }
+        } else if (now >= nextRandomEventAtMillis) {
+            triggerRandomEvent(enabled);
+            nextRandomEventAtMillis = now + randomEventDelayMillis();
+        }
+    }
+
+    private void resetRandomEventSchedule() {
+        nextTimedEventSecond = Math.max(MIN_EVENT_INTERVAL_SECONDS, randomEventIntervalSeconds);
+        nextRandomEventAtMillis = System.currentTimeMillis() + randomEventDelayMillis();
+    }
+
+    private long randomEventDelayMillis() {
+        long base = randomEventIntervalSeconds * 1_000L;
+        if (randomEventMode == RandomEventMode.TIMED) {
+            return base;
+        }
+        long minimum = Math.max(MIN_EVENT_INTERVAL_SECONDS * 1_000L, base / 2L);
+        long maximum = Math.max(minimum, base + base / 2L);
+        return ThreadLocalRandom.current().nextLong(minimum, maximum + 1L);
+    }
+
+    private void triggerRandomEvent(List<RandomEventType> enabled) {
+        RandomEventType type = enabled.get(ThreadLocalRandom.current().nextInt(enabled.size()));
+        long now = System.currentTimeMillis();
+        switch (type) {
+            case HIDER_REVEAL -> {
+                for (UUID id : new ArrayList<>(roles.keySet())) {
+                    if (roles.get(id) == Role.HIDER) {
+                        Player hider = Bukkit.getPlayer(id);
+                        if (hider != null && hider.isOnline()) {
+                            reveal(hider, REVEAL_MILLIS);
+                        }
+                    }
+                }
+                broadcast(Component.text("随机事件：所有躲藏者暴露 5 秒。", NamedTextColor.RED));
+            }
+            case HIDER_SLOW -> {
+                for (Map.Entry<UUID, Role> entry : roles.entrySet()) {
+                    if (entry.getValue() == Role.HIDER) {
+                        PlayerRoundState state = playerStates.get(entry.getKey());
+                        if (state != null) {
+                            state.eventSlowUntil = now + 10_000L;
+                            state.eventSlowAmplifier = Math.min(MAX_SLOW_AMPLIFIER, hiderSlowAmplifier + 2);
+                        }
+                    }
+                }
+                broadcast(Component.text("随机事件：躲藏者获得额外缓慢效果 10 秒。", NamedTextColor.RED));
+            }
+            case HUNTER_HASTE -> {
+                for (Map.Entry<UUID, Role> entry : roles.entrySet()) {
+                    if (isHunter(entry.getValue())) {
+                        PlayerRoundState state = playerStates.get(entry.getKey());
+                        if (state != null) {
+                            state.eventSpeedUntil = now + 10_000L;
+                            state.eventSpeedAmplifier = 3;
+                        }
+                    }
+                }
+                broadcast(Component.text("随机事件：抓捕者获得额外速度 10 秒。", NamedTextColor.GOLD));
+            }
+            case HIDER_BOOST -> {
+                for (Map.Entry<UUID, Role> entry : roles.entrySet()) {
+                    if (entry.getValue() == Role.HIDER) {
+                        PlayerRoundState state = playerStates.get(entry.getKey());
+                        if (state != null) {
+                            state.eventSpeedUntil = now + 5_000L;
+                            state.eventSpeedAmplifier = 6;
+                        }
+                    }
+                }
+                broadcast(Component.text("随机事件：躲藏者获得短暂加速 5 秒。", NamedTextColor.GREEN));
+            }
+        }
+    }
+
+    private RandomEventMode parseRandomEventMode(String value, RandomEventMode fallback) {
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            return RandomEventMode.valueOf(value.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ignored) {
+            return fallback;
+        }
+    }
+
+    private RadarMode parseRadarMode(String value, RadarMode fallback) {
+        if (value == null) {
+            return fallback;
+        }
+        try {
+            return RadarMode.valueOf(value.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ignored) {
+            return fallback;
+        }
     }
 
     private int hiderCount() {
@@ -272,6 +557,12 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         inventory.setItem(14, menuItem(Material.CHEST, "发放当前角色道具", "kit"));
         inventory.setItem(15, menuItem(Material.REPEATER, "单人测试：躲藏者", "test_hider"));
         inventory.setItem(16, menuItem(Material.TARGET, "单人测试：抓捕者", "test_hunter"));
+        inventory.setItem(0, menuItem(Material.CLOCK,
+                "体型节点 1：" + formatDuration(scaleThresholds[1]), "scale_time_1"));
+        inventory.setItem(1, menuItem(Material.CLOCK,
+                "体型节点 2：" + formatDuration(scaleThresholds[2]), "scale_time_2"));
+        inventory.setItem(2, menuItem(Material.CLOCK,
+                "体型节点 3：" + formatDuration(scaleThresholds[3]), "scale_time_3"));
         inventory.setItem(22, ComponentItem(Material.PAPER, "状态：" + phaseText(),
                 "剩余时间：" + formatRemaining(), "躲藏者：" + hiderCount(), "上局：" + lastResult));
         inventory.setItem(19, menuItem(Material.REDSTONE_TORCH, "时间 -30 秒", "time_minus_30"));
@@ -281,10 +572,48 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         inventory.setItem(24, menuItem(Material.NETHERITE_BLOCK, "跳到 8 分钟", "time_480"));
         inventory.setItem(25, menuItem(Material.GOLDEN_SWORD, "强制抓捕者胜利", "win_hunter"));
         inventory.setItem(26, menuItem(Material.GOLDEN_APPLE, "强制躲藏者胜利", "win_hider"));
+        inventory.setItem(39, ComponentItem(Material.SPYGLASS,
+                "体型阶段 " + (selectedScaleStage + 1) + " / 4",
+                "当前倍率：" + formatScale(hiderScales[selectedScaleStage]),
+                "约高：" + displayHiderHeight(selectedScaleStage) + " 格",
+                "点击下方按钮调整，阶段按钮切换"));
+        inventory.setItem(40, menuItem(Material.RED_CONCRETE, "体型倍率 -0.01", "scale_minus"));
+        inventory.setItem(41, menuItem(Material.GREEN_CONCRETE, "体型倍率 +0.01", "scale_plus"));
+        inventory.setItem(42, menuItem(Material.CLOCK, "切换体型阶段", "scale_stage_next"));
+        inventory.setItem(43, ComponentItem(Material.POTION,
+                "躲藏者缓慢配置",
+                "触发：" + formatDuration(hiderSlowTriggerSeconds),
+                "等级：缓慢 " + (hiderSlowAmplifier + 1),
+                "点击按钮循环调整"));
+        inventory.setItem(44, menuItem(Material.REPEATER, "缓慢触发时间 +30秒", "slow_time_next"));
+        inventory.setItem(45, menuItem(Material.REDSTONE, "缓慢等级 +1", "slow_amp_next"));
+        inventory.setItem(46, menuItem(Material.COMPASS, "雷达模式：" + radarModeText(), "radar_mode"));
+        inventory.setItem(47, menuItem(randomEventsEnabled ? Material.LIME_WOOL : Material.GRAY_WOOL,
+                "随机事件：" + (randomEventsEnabled ? "开启" : "关闭"), "events_toggle"));
+        inventory.setItem(48, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HIDER_REVEAL, true)
+                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
+                "事件：全体暴露 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HIDER_REVEAL, true)),
+                "event_toggle_" + RandomEventType.HIDER_REVEAL.configKey));
+        inventory.setItem(49, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HIDER_SLOW, true)
+                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
+                "事件：躲藏者减速 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HIDER_SLOW, true)),
+                "event_toggle_" + RandomEventType.HIDER_SLOW.configKey));
+        inventory.setItem(50, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HUNTER_HASTE, true)
+                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
+                "事件：抓捕者加速 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HUNTER_HASTE, true)),
+                "event_toggle_" + RandomEventType.HUNTER_HASTE.configKey));
+        inventory.setItem(51, menuItem(randomEventEnabled.getOrDefault(RandomEventType.HIDER_BOOST, true)
+                        ? Material.REDSTONE_TORCH : Material.GRAY_DYE,
+                "事件：躲藏者加速 " + onOff(randomEventEnabled.getOrDefault(RandomEventType.HIDER_BOOST, true)),
+                "event_toggle_" + RandomEventType.HIDER_BOOST.configKey));
+        inventory.setItem(52, menuItem(Material.DAYLIGHT_DETECTOR,
+                "事件触发：" + randomEventModeText(), "events_mode"));
+        inventory.setItem(53, menuItem(Material.CLOCK,
+                "事件间隔 +15秒（当前 " + randomEventIntervalSeconds + "）", "events_interval_next"));
 
         List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
         players.sort(Comparator.comparing(Player::getName, String.CASE_INSENSITIVE_ORDER));
-        for (int i = 0; i < players.size() && i < 27; i++) {
+        for (int i = 0; i < players.size() && i < 12; i++) {
             Player player = players.get(i);
             inventory.setItem(27 + i, playerHead(player));
         }
@@ -329,6 +658,22 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         return item;
     }
 
+    private String formatScale(double value) {
+        return String.format(Locale.ROOT, "%.2f", value);
+    }
+
+    private String onOff(boolean enabled) {
+        return enabled ? "开启" : "关闭";
+    }
+
+    private String radarModeText() {
+        return radarMode == RadarMode.CHUNK ? "原区块" : "边长10格立方体";
+    }
+
+    private String randomEventModeText() {
+        return randomEventMode == RandomEventMode.RANDOM ? "随机" : "定时";
+    }
+
     @EventHandler(priority = EventPriority.NORMAL, ignoreCancelled = true)
     public void onInteract(PlayerInteractEvent event) {
         if (phase != GamePhase.RUNNING || !isUseAction(event.getAction())) {
@@ -356,16 +701,16 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                 state.boostUntil = System.currentTimeMillis() + BOOST_MILLIS;
                 state.fatigueUntil = state.boostUntil + FATIGUE_MILLIS;
             }
-            player.playSound(player.getLocation(), Sound.MUSIC_DISC_CAT, SoundCategory.PLAYERS, 1.0f, 1.4f);
-            player.sendMessage(Component.text("阿巴图坎片生效：巨额加速 3 秒，随后疲劳 10 秒。", NamedTextColor.GREEN));
+            player.playSound(player.getLocation(), "minecraft:particle.soul_escape",
+                    SoundCategory.PLAYERS, 0.35f, 1.5f);
+            player.sendMessage(Component.text("阿巴土坎片生效：巨额加速 3 秒，随后疲劳 10 秒。", NamedTextColor.GREEN));
         } else if (kind.equals("whistle")) {
             if (role != Role.HIDER) {
                 return;
             }
             event.setCancelled(true);
             int level = whistleLevel(item);
-            consumeOne(player);
-            playWhistle(player, level);
+            useWhistle(player, level);
         } else if (kind.equals("grenade")) {
             if (!isHunter(role)) {
                 return;
@@ -409,6 +754,29 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         source.sendMessage(Component.text("嘲讽哨等级 " + level + " 已吹响。", NamedTextColor.YELLOW));
     }
 
+    private void useWhistle(Player player, int level) {
+        UUID id = player.getUniqueId();
+        long now = System.currentTimeMillis();
+        Map<Integer, Long> cooldowns = whistleCooldowns.computeIfAbsent(id, ignored -> new ConcurrentHashMap<>());
+        long readyAt = cooldowns.getOrDefault(level, 0L);
+        if (readyAt > now) {
+            player.sendMessage(Component.text("嘲讽哨等级 " + level + " 冷却中，还需 "
+                    + ((readyAt - now + 999) / 1_000) + " 秒。", NamedTextColor.RED));
+            return;
+        }
+
+        cooldowns.put(level, now + WHISTLE_COOLDOWN_MILLIS);
+        playWhistle(player, level);
+        Set<Integer> cycle = whistleCycles.computeIfAbsent(id, ignored -> ConcurrentHashMap.newKeySet());
+        cycle.add(level);
+        if (cycle.containsAll(Set.of(1, 2, 3))) {
+            cycle.clear();
+            player.getInventory().addItem(customItem(Material.MUSIC_DISC_CAT, "阿巴土坎片", "abatukan", 1,
+                    "使用后加速 3 秒，随后疲劳 10 秒。"));
+            player.sendMessage(Component.text("三个等级的嘲讽哨都已使用，获得一张阿巴土坎片。", NamedTextColor.GREEN));
+        }
+    }
+
     private void showChunkRadar(Player hunter) {
         Location hunterLocation = hunter.getLocation();
         int chunkX = hunterLocation.getBlockX() >> 4;
@@ -421,12 +789,15 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             Player hider = Bukkit.getPlayer(entry.getKey());
             Location location = lastLocations.get(entry.getKey());
             if (hider != null && location != null && location.getWorld().equals(hunterLocation.getWorld())
-                    && (location.getBlockX() >> 4) == chunkX
-                    && (location.getBlockZ() >> 4) == chunkZ) {
+                    && (radarMode == RadarMode.CUBE_10
+                    ? isWithinCube(hunterLocation, location)
+                    : (location.getBlockX() >> 4) == chunkX && (location.getBlockZ() >> 4) == chunkZ)) {
                 count++;
             }
         }
-        hunter.sendMessage(Component.text("区块雷达：当前区块有 " + count + " 名躲藏者。", NamedTextColor.AQUA));
+        String modeText = radarMode == RadarMode.CHUNK ? "区块" : "边长10格立方体";
+        hunter.sendMessage(Component.text("雷达（" + modeText + "）：范围内有 " + count + " 名躲藏者。",
+                NamedTextColor.AQUA));
         hunter.playSound(hunter.getLocation(), Sound.BLOCK_NOTE_BLOCK_CHIME, SoundCategory.PLAYERS, 1.0f, 1.4f);
     }
 
@@ -454,7 +825,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         Vector direction = targetLocation.clone().add(0, 0.8, 0).toVector().subtract(launch.toVector()).normalize();
         ShulkerBullet bullet = hunter.getWorld().spawn(launch, ShulkerBullet.class, spawned -> {
             spawned.setShooter(hunter);
-            spawned.setVelocity(direction.multiply(1.2));
+            spawned.setVelocity(direction.multiply(TRACKING_BULLET_SPEED));
             spawned.getPersistentDataContainer().set(projectileKey, PersistentDataType.STRING, "tracking");
             spawned.getPersistentDataContainer().set(targetKey, PersistentDataType.STRING, target.getUniqueId().toString());
         });
@@ -468,9 +839,38 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
                 .filter(player -> roles.get(player.getUniqueId()) == Role.HIDER)
                 .filter(player -> lastLocations.get(player.getUniqueId()) != null)
                 .filter(player -> lastLocations.get(player.getUniqueId()).getWorld().equals(source.getWorld()))
+                .filter(player -> radarMode != RadarMode.CUBE_10
+                        || isWithinCube(sourceLocation, lastLocations.get(player.getUniqueId())))
                 .min(Comparator.comparingDouble(player -> lastLocations.get(player.getUniqueId())
                         .distanceSquared(sourceLocation)))
                 .orElse(null);
+    }
+
+    private boolean isWithinCube(Location center, Location target) {
+        return target != null
+                && Math.abs(target.getX() - center.getX()) <= 5.0
+                && Math.abs(target.getY() - center.getY()) <= 5.0
+                && Math.abs(target.getZ() - center.getZ()) <= 5.0;
+    }
+
+    private void enforceTrackingBulletSpeed() {
+        for (UUID id : new ArrayList<>(gameEntities)) {
+            Entity entity = Bukkit.getEntity(id);
+            if (!(entity instanceof ShulkerBullet bullet)
+                    || !"tracking".equals(bullet.getPersistentDataContainer()
+                    .get(projectileKey, PersistentDataType.STRING))) {
+                continue;
+            }
+            bullet.getScheduler().run(plugin, task -> {
+                if (!bullet.isValid()) {
+                    return;
+                }
+                Vector velocity = bullet.getVelocity();
+                if (velocity.lengthSquared() > 0.000001) {
+                    bullet.setVelocity(velocity.normalize().multiply(TRACKING_BULLET_SPEED));
+                }
+            }, () -> { });
+        }
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
@@ -502,6 +902,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
 
         String weapon = damageWeapon(event.getDamager(), attacker);
         if (weapon == null) {
+            event.setCancelled(true);
             return;
         }
         event.setCancelled(true);
@@ -509,6 +910,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         int hits = hitMap.merge(target.getUniqueId(), 1, Integer::sum);
         if (hits >= MAX_HITS) {
             hitMap.remove(target.getUniqueId());
+            lastHiderAttackers.put(target.getUniqueId(), attacker.getUniqueId());
             target.setHealth(0.0);
         } else {
             target.setHealth(Math.max(1.0, target.getMaxHealth() / 2.0));
@@ -559,17 +961,21 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         } else if (kind.equals("tracking")) {
             Entity hit = event.getHitEntity();
             if (hit instanceof Player player && roles.get(player.getUniqueId()) == Role.HIDER) {
-                reveal(player, REVEAL_MILLIS);
+                reveal(player, REVEAL_MILLIS, Sound.ENTITY_ENDERMAN_SCREAM);
             }
         }
         projectile.remove();
     }
 
     private void reveal(Player player, long duration) {
-        player.getScheduler().run(plugin, task -> beginReveal(player, duration), () -> { });
+        reveal(player, duration, Sound.ENTITY_SHULKER_SHOOT);
     }
 
-    private void beginReveal(Player player, long duration) {
+    private void reveal(Player player, long duration, Sound sound) {
+        player.getScheduler().run(plugin, task -> beginReveal(player, duration, sound), () -> { });
+    }
+
+    private void beginReveal(Player player, long duration, Sound sound) {
         PlayerRoundState state = playerStates.get(player.getUniqueId());
         if (state == null) {
             return;
@@ -591,7 +997,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             for (Player viewer : Bukkit.getOnlinePlayers()) {
                 Location soundLocation = player.getLocation().clone();
                 viewer.getScheduler().run(plugin,
-                        viewerTask -> viewer.playSound(soundLocation, Sound.ENTITY_SHULKER_SHOOT,
+                        viewerTask -> viewer.playSound(soundLocation, sound,
                                 SoundCategory.PLAYERS, 1.2f, 0.8f), () -> { });
             }
         }, () -> revealTasks.remove(player.getUniqueId()), 1L, 20L);
@@ -606,6 +1012,10 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         UUID id = event.getEntity().getUniqueId();
         if (roles.get(id) == Role.HIDER) {
             Player killer = event.getEntity().getKiller();
+            UUID trackedKiller = lastHiderAttackers.remove(id);
+            if (killer == null && trackedKiller != null) {
+                killer = Bukkit.getPlayer(trackedKiller);
+            }
             if (killer != null && roles.get(killer.getUniqueId()) == Role.HUNTER) {
                 radarCooldowns.put(killer.getUniqueId(), 0L);
                 killer.sendMessage(Component.text("成功击杀躲藏者，追踪雷达冷却已重置。", NamedTextColor.GREEN));
@@ -708,6 +1118,67 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             finishGame("管理员判定：抓捕者胜利！");
         } else if (value.equals("win_hider")) {
             finishGame("管理员判定：躲藏者胜利！");
+        } else if (value.equals("scale_time_1") || value.equals("scale_time_2") || value.equals("scale_time_3")) {
+            int stage = Integer.parseInt(value.substring("scale_time_".length()));
+            adjustScaleThreshold(stage, event.getClick() == ClickType.RIGHT ? -30 : 30);
+            saveGameConfig();
+            markHiderScalesDirty();
+            admin.sendMessage(Component.text("体型节点 " + stage + " 已调整为 "
+                    + formatDuration(scaleThresholds[stage]) + "（左键 +30 秒，右键 -30 秒）。", NamedTextColor.GREEN));
+        } else if (value.equals("scale_minus")) {
+            hiderScales[selectedScaleStage] = clampScale(selectedScaleStage,
+                    hiderScales[selectedScaleStage] - 0.01);
+            markHiderScalesDirty();
+            saveGameConfig();
+            admin.sendMessage(Component.text("体型阶段 " + (selectedScaleStage + 1)
+                    + " 倍率已调整为 " + formatScale(hiderScales[selectedScaleStage]) + "。", NamedTextColor.GREEN));
+        } else if (value.equals("scale_plus")) {
+            hiderScales[selectedScaleStage] = clampScale(selectedScaleStage,
+                    hiderScales[selectedScaleStage] + 0.01);
+            markHiderScalesDirty();
+            saveGameConfig();
+            admin.sendMessage(Component.text("体型阶段 " + (selectedScaleStage + 1)
+                    + " 倍率已调整为 " + formatScale(hiderScales[selectedScaleStage]) + "。", NamedTextColor.GREEN));
+        } else if (value.equals("scale_stage_next")) {
+            selectedScaleStage = (selectedScaleStage + 1) % hiderScales.length;
+        } else if (value.equals("slow_time_next")) {
+            hiderSlowTriggerSeconds += 30;
+            if (hiderSlowTriggerSeconds >= ROUND_SECONDS) {
+                hiderSlowTriggerSeconds = 30;
+            }
+            saveGameConfig();
+        } else if (value.equals("slow_amp_next")) {
+            hiderSlowAmplifier = (hiderSlowAmplifier + 1) % (MAX_SLOW_AMPLIFIER + 1);
+            saveGameConfig();
+        } else if (value.equals("radar_mode")) {
+            radarMode = radarMode == RadarMode.CHUNK ? RadarMode.CUBE_10 : RadarMode.CHUNK;
+            saveGameConfig();
+            admin.sendMessage(Component.text("雷达模式已切换为：" + radarModeText() + "。", NamedTextColor.GREEN));
+        } else if (value.equals("events_toggle")) {
+            randomEventsEnabled = !randomEventsEnabled;
+            resetRandomEventSchedule();
+            saveGameConfig();
+        } else if (value.equals("events_mode")) {
+            randomEventMode = randomEventMode == RandomEventMode.RANDOM
+                    ? RandomEventMode.TIMED : RandomEventMode.RANDOM;
+            resetRandomEventSchedule();
+            saveGameConfig();
+        } else if (value.equals("events_interval_next")) {
+            randomEventIntervalSeconds += 15;
+            if (randomEventIntervalSeconds > ROUND_SECONDS) {
+                randomEventIntervalSeconds = MIN_EVENT_INTERVAL_SECONDS;
+            }
+            resetRandomEventSchedule();
+            saveGameConfig();
+        } else if (value.startsWith("event_toggle_")) {
+            String key = value.substring("event_toggle_".length());
+            for (RandomEventType type : RandomEventType.values()) {
+                if (type.configKey.equals(key)) {
+                    randomEventEnabled.put(type, !randomEventEnabled.getOrDefault(type, true));
+                    saveGameConfig();
+                    break;
+                }
+            }
         } else {
             try {
                 UUID target = UUID.fromString(value);
@@ -759,12 +1230,17 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         phase = GamePhase.RUNNING;
         testMode = false;
         startedAtMillis = System.currentTimeMillis();
+        announcedScaleStage = 0;
+        resetRandomEventSchedule();
         lastResult = "进行中";
         playerStates.clear();
         lastLocations.clear();
         swordHits.clear();
         bowHits.clear();
+        lastHiderAttackers.clear();
         radarCooldowns.clear();
+        whistleCooldowns.clear();
+        whistleCycles.clear();
         pendingConversion.clear();
         for (Player player : players) {
             player.getScheduler().run(plugin, task -> {
@@ -787,9 +1263,13 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         phase = GamePhase.RUNNING;
         testMode = true;
         startedAtMillis = System.currentTimeMillis();
+        announcedScaleStage = 0;
+        resetRandomEventSchedule();
         lastResult = "单人测试中";
         roles.clear();
         playerStates.clear();
+        whistleCooldowns.clear();
+        whistleCycles.clear();
         roles.put(player.getUniqueId(), role);
         player.getScheduler().run(plugin, task -> {
             playerStates.put(player.getUniqueId(), PlayerRoundState.capture(player));
@@ -806,6 +1286,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             startedAtMillis -= seconds * 1_000L;
             long elapsed = Math.max(0L, Math.min(ROUND_SECONDS - 1, elapsedSeconds()));
             startedAtMillis = System.currentTimeMillis() - elapsed * 1_000L;
+            announcedScaleStage = scaleStage(elapsed);
         }
     }
 
@@ -813,6 +1294,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         if (phase == GamePhase.RUNNING) {
             long elapsed = Math.max(0L, Math.min(ROUND_SECONDS - 1, seconds));
             startedAtMillis = System.currentTimeMillis() - elapsed * 1_000L;
+            announcedScaleStage = scaleStage(elapsed);
             for (PlayerRoundState state : playerStates.values()) {
                 state.scaleStage = -1;
             }
@@ -850,7 +1332,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         if (role == Role.HIDER) {
             AttributeInstance scale = player.getAttribute(Attribute.SCALE);
             if (scale != null) {
-                scale.setBaseValue(1.0);
+                scale.setBaseValue(hiderScales[0]);
             }
             player.setPose(Pose.STANDING, false);
             updatePlayer(player, 0L);
@@ -878,7 +1360,7 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
 
     private void giveHiderKit(Player player) {
         PlayerInventory inventory = player.getInventory();
-        inventory.addItem(customItem(Material.MUSIC_DISC_CAT, "阿巴图坎片", "abatukan", 1,
+        inventory.addItem(customItem(Material.MUSIC_DISC_CAT, "阿巴土坎片", "abatukan", 1,
                 "使用后加速 3 秒，随后疲劳 10 秒。"));
         inventory.addItem(nailBrick());
         for (int level = 1; level <= 3; level++) {
@@ -973,8 +1455,38 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             return;
         }
         lastResult = message;
+        List<UUID> participants = new ArrayList<>(playerStates.keySet());
         broadcast(Component.text(message, NamedTextColor.GOLD));
+        celebrateVictory(participants, message);
         stopGame(null, false);
+    }
+
+    private void celebrateVictory(Collection<UUID> participants, String message) {
+        boolean hidersWon = message.contains("躲藏者胜利");
+        Component titleText = Component.text(hidersWon ? "躲藏者胜利！" : "抓捕者胜利！", NamedTextColor.GOLD);
+        Component subtitleText = Component.text("本局游戏结束", NamedTextColor.YELLOW);
+        Title title = Title.title(titleText, subtitleText,
+                Title.Times.times(Duration.ofMillis(700), Duration.ofMillis(3_000), Duration.ofMillis(1_500)));
+        for (UUID id : participants) {
+            Player player = Bukkit.getPlayer(id);
+            if (player == null || !player.isOnline()) {
+                continue;
+            }
+            player.getScheduler().run(plugin, task -> {
+                player.showTitle(title);
+                Firework firework = player.getWorld().spawn(player.getLocation().clone().add(0, 1, 0), Firework.class);
+                FireworkMeta meta = firework.getFireworkMeta();
+                meta.setPower(1);
+                meta.addEffect(FireworkEffect.builder()
+                        .with(FireworkEffect.Type.BALL_LARGE)
+                        .withColor(hidersWon ? Color.AQUA : Color.RED, Color.YELLOW)
+                        .withFade(Color.WHITE)
+                        .trail(true)
+                        .flicker(true)
+                        .build());
+                firework.setFireworkMeta(meta);
+            }, () -> { });
+        }
     }
 
     public void stopGame(org.bukkit.command.CommandSender sender, boolean notify) {
@@ -994,7 +1506,16 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
             Player player = Bukkit.getPlayer(id);
             PlayerRoundState state = playerStates.get(id);
             if (player != null && state != null) {
-                player.getScheduler().run(plugin, task -> state.restore(player), () -> { });
+                player.getScheduler().run(plugin, task -> {
+                    state.restore(player);
+                    plugin.releaseAnchorForGame(player);
+                    clearGameItems(player);
+                }, () -> { });
+            }
+        }
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (!playerStates.containsKey(player.getUniqueId())) {
+                player.getScheduler().run(plugin, task -> clearGameItems(player), () -> { });
             }
         }
         playerStates.clear();
@@ -1002,7 +1523,10 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         lastLocations.clear();
         swordHits.clear();
         bowHits.clear();
+        lastHiderAttackers.clear();
         radarCooldowns.clear();
+        whistleCooldowns.clear();
+        whistleCycles.clear();
         pendingConversion.clear();
         for (UUID id : new ArrayList<>(gameEntities)) {
             Entity entity = Bukkit.getEntity(id);
@@ -1014,6 +1538,28 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         if (sender != null && notify) {
             sender.sendMessage(Component.text("躲猫猫游戏已停止。", NamedTextColor.YELLOW));
         }
+    }
+
+    private void clearGameItems(Player player) {
+        PlayerInventory inventory = player.getInventory();
+        for (int slot = 0; slot < inventory.getSize(); slot++) {
+            if (isGameItem(inventory.getItem(slot))) {
+                inventory.setItem(slot, null);
+            }
+        }
+        ItemStack cursor = player.getOpenInventory().getCursor();
+        if (isGameItem(cursor)) {
+            player.getOpenInventory().setCursor(null);
+        }
+    }
+
+    private boolean isGameItem(ItemStack item) {
+        if (item == null || !item.hasItemMeta() || item.getItemMeta() == null) {
+            return false;
+        }
+        PersistentDataContainer data = item.getItemMeta().getPersistentDataContainer();
+        return data.has(itemKey, PersistentDataType.STRING)
+                || data.has(nailBrickKey, PersistentDataType.BYTE);
     }
 
     private void broadcast(Component message) {
@@ -1034,8 +1580,12 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         if (phase != GamePhase.RUNNING) {
             return "10:00";
         }
-        long remaining = Math.max(0, ROUND_SECONDS - elapsedSeconds());
-        return String.format(Locale.ROOT, "%02d:%02d", remaining / 60, remaining % 60);
+        return formatRemaining(elapsedSeconds());
+    }
+
+    private String formatRemaining(long elapsed) {
+        long remaining = Math.max(0L, ROUND_SECONDS - elapsed);
+        return formatDuration(remaining);
     }
 
     private void sendStatus(org.bukkit.command.CommandSender sender) {
@@ -1156,6 +1706,31 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         ELIMINATED_HUNTER
     }
 
+    private enum RadarMode {
+        CHUNK,
+        CUBE_10
+    }
+
+    private enum RandomEventMode {
+        RANDOM,
+        TIMED
+    }
+
+    private enum RandomEventType {
+        HIDER_REVEAL("hider-reveal", "全体暴露"),
+        HIDER_SLOW("hider-slow", "躲藏者减速"),
+        HUNTER_HASTE("hunter-haste", "抓捕者加速"),
+        HIDER_BOOST("hider-boost", "躲藏者加速");
+
+        private final String configKey;
+        private final String displayName;
+
+        RandomEventType(String configKey, String displayName) {
+            this.configKey = configKey;
+            this.displayName = displayName;
+        }
+    }
+
     private static final class AdminMenuHolder implements InventoryHolder {
         private Inventory inventory;
 
@@ -1173,6 +1748,10 @@ public final class HideAndSeekManager implements Listener, org.bukkit.command.Co
         private long boostUntil;
         private long fatigueUntil;
         private long revealUntil;
+        private long eventSlowUntil;
+        private int eventSlowAmplifier;
+        private long eventSpeedUntil;
+        private int eventSpeedAmplifier;
 
         private PlayerRoundState(Double originalScale, Pose originalPose) {
             this.originalScale = originalScale;

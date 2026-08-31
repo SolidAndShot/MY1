@@ -4,7 +4,7 @@ main: com.solidandshot.lightningcrowbar.LightningCrowbarPlugin
 api-version: '26.2'
 folia-supported: true
 author: SolidAndShot
-description: A Folia-compatible crowbar that calls lightning when it hits a living entity.
+description: A configurable 10-minute hide-and-seek game for Luminol and Folia servers.
 
 commands:
   hns:

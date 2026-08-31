@@ -1,0 +1,24 @@
+hns:
+  scales:
+    0: 0.54
+    1: 0.82
+    2: 1.10
+    3: 1.65
+  scale-thresholds:
+    1: 180
+    2: 300
+    3: 480
+  hider-slow:
+    trigger-seconds: 30
+    amplifier: 5
+  radar:
+    mode: CHUNK
+  random-events:
+    enabled: false
+    mode: RANDOM
+    interval-seconds: 120
+    events:
+      hider-reveal: true
+      hider-slow: true
+      hunter-haste: true
+      hider-boost: true

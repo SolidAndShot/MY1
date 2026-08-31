@@ -49,6 +49,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
     private static final double FINE_STEP = 0.05;
     private static final double LARGE_STEP = 0.5;
     private static final double POSITION_EPSILON = 0.00000001;
+    private static final double ANCHOR_HEIGHT_LIMIT = 5.0;
 
     private NamespacedKey crowbarKey;
     private NamespacedKey nailBrickKey;
@@ -60,6 +61,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
     @Override
     public void onEnable() {
+        saveDefaultConfig();
         crowbarKey = new NamespacedKey(this, "lightning_crowbar");
         nailBrickKey = new NamespacedKey(this, "nail_brick");
         getServer().getPluginManager().registerEvents(this, this);
@@ -401,7 +403,11 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
             return;
         }
 
-        state.location = offset(state.location, moveX, moveY, moveZ, player.getLocation());
+        Location adjusted = offset(state.location, moveX, moveY, moveZ, player.getLocation());
+        if (adjusted.getY() > state.maximumY) {
+            adjusted.setY(state.maximumY);
+        }
+        state.location = adjusted;
         requestAnchorTeleport(player, state);
     }
 
@@ -444,6 +450,17 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         inputStates.remove(player.getUniqueId());
         if (notify) {
             player.sendMessage(Component.text("你已使用移动键，固定状态已解除。", NamedTextColor.YELLOW));
+        }
+    }
+
+    /**
+     * Releases a player's nail-brick anchor when a hide-and-seek round ends.
+     * The established input and adjustment algorithm remains unchanged.
+     */
+    void releaseAnchorForGame(Player player) {
+        AnchorState state = anchors.get(player.getUniqueId());
+        if (state != null) {
+            releaseAnchor(player, state, false);
         }
     }
 
@@ -541,6 +558,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
     private static final class AnchorState {
         private Location location;
+        private final double maximumY;
         private AnchorMode mode = AnchorMode.FIXED;
         private final boolean originalGravity;
         private boolean teleportPending;
@@ -548,6 +566,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
 
         private AnchorState(Location location, boolean originalGravity) {
             this.location = location.clone();
+            this.maximumY = location.getY() + ANCHOR_HEIGHT_LIMIT;
             this.originalGravity = originalGravity;
         }
     }
