@@ -13,6 +13,7 @@ import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
+import org.bukkit.event.Event;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
@@ -180,7 +181,7 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         livingTarget.getWorld().strikeLightning(livingTarget.getLocation());
     }
 
-    @EventHandler(priority = EventPriority.NORMAL, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
     public void onNailBrickInteract(PlayerInteractEvent event) {
         if (!isNailBrick(event.getItem())) {
             return;
@@ -189,6 +190,8 @@ public final class LightningCrowbarPlugin extends JavaPlugin implements Listener
         Action action = event.getAction();
         if (action == Action.RIGHT_CLICK_AIR || action == Action.RIGHT_CLICK_BLOCK) {
             event.setCancelled(true);
+            event.setUseInteractedBlock(Event.Result.DENY);
+            event.setUseItemInHand(Event.Result.DENY);
             handleRightClick(event.getPlayer());
         } else if ((action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK)
                 && anchors.get(event.getPlayer().getUniqueId()) instanceof AnchorState state

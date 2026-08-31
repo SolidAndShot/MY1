@@ -9,7 +9,7 @@ description: A configurable 10-minute hide-and-seek game for Luminol and Folia s
 commands:
   hns:
     description: Controls the 10-minute hide-and-seek game.
-    usage: /hns <admin|start|stop|randomize|setrole|test|kit|status>
+    usage: /hns <admin|start|stop|randomize|setrole|givehat|test|kit|status>
     aliases: [hidenseek]
     permission: lightningcrowbar.hns
 

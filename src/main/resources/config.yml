@@ -13,6 +13,8 @@ hns:
     amplifier: 5
   radar:
     mode: CHUNK
+  whistle:
+    mode: SOUND
   items:
     hider:
       abatukan: true
